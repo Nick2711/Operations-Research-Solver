@@ -1,24 +1,299 @@
-   .file-input-label:hover {
-            background-color: #f3f4f6;
-        }
-        .output-container {
-            min-height: 300px;
-            max-height: 500px;
-            overflow-y: auto;
-        }
-        .sensitivity-btn {
-            transition: all 0.2s ease;
-        }
-        .sensitivity-btn:hover {
-            transform: translateY(-2px);
-        }
-        .tab-content {
-            display: none;
-        }
-        .tab-content.active {
-            display: block;
-        }
-        #filePreview {
-            white-space: pre-wrap;
-            font-family: monospace;
-        }
+/* Base Styles */
+body {
+    background-color: #FBF9F1;
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    color: #333;
+    line-height: 1.6;
+}
+
+/* Container & Layout */
+.container {
+    background-color: #FBF9F1;
+    min-height: 100vh;
+}
+
+/* Header */
+header {
+    background-color: #92C7CF;
+    padding: 2rem;
+    border-radius: 0.5rem;
+    margin-bottom: 2rem;
+    color: white;
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+}
+
+    header h1 {
+        font-weight: 700;
+        font-size: 2.5rem;
+        margin-bottom: 0.5rem;
+    }
+
+    header p {
+        opacity: 0.9;
+        font-size: 1.1rem;
+    }
+
+/* Main Card */
+.bg-white {
+    background-color: white;
+    border-radius: 0.75rem;
+    box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
+}
+
+/* Tabs */
+.flex.border-b {
+    background-color: #E5E1DA;
+    border-top-left-radius: 0.75rem;
+    border-top-right-radius: 0.75rem;
+    padding-left: 1rem;
+}
+
+.tab-btn {
+    transition: all 0.3s ease;
+    position: relative;
+    color: #4a5568;
+    font-weight: 500;
+    border-bottom-width: 3px;
+    margin-bottom: -1px;
+}
+
+    .tab-btn:hover {
+        color: #2d3748;
+        background-color: rgba(255, 255, 255, 0.5);
+    }
+
+    .tab-btn.active {
+        color: #2b6cb0;
+        border-color: #2b6cb0;
+        background-color: white;
+        border-top-left-radius: 0.5rem;
+        border-top-right-radius: 0.5rem;
+    }
+
+/* File Upload Section */
+.file-input-label {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 2rem;
+    border: 2px dashed #AAD7D9;
+    border-radius: 0.5rem;
+    background-color: rgba(170, 215, 217, 0.1);
+    cursor: pointer;
+    transition: all 0.3s ease;
+    width: 100%;
+    box-sizing: border-box; /* Ensures padding is included in width */
+}
+/*uplodad box*/
+.file-input-label:hover {
+    border-color: #92C7CF;
+    background-color: rgba(170, 215, 217, 0.2);
+}
+
+/* Remove default input styling */
+#modelFile {
+    position: absolute;
+    opacity: 0;
+    width: 0.1px;
+    height: 0.1px;
+    overflow: hidden;
+    z-index: -1;
+}
+
+/* Center the upload icon and text */
+.file-input-label .flex {
+    width: 100%;
+}
+
+/* Model Summary & Algorithm Selection */
+.bg-gray-50 {
+    background-color: #FBF9F1;
+    border: 1px solid #E5E1DA;
+    border-radius: 0.5rem;
+}
+
+/* Buttons */
+button {
+    transition: all 0.2s ease;
+}
+
+    button:disabled {
+        opacity: 0.7;
+        cursor: not-allowed;
+    }
+
+#runSolverBtn {
+    background-color: #92C7CF;
+    color: white;
+}
+
+    #runSolverBtn:hover {
+        background-color: #7ab7c0;
+    }
+
+#downloadResultsBtn {
+    background-color: #AAD7D9;
+    color: #2d3748;
+}
+
+    #downloadResultsBtn:hover {
+        background-color: #9bccce;
+    }
+
+#resetSolverBtn {
+    background-color: #E5E1DA;
+    color: #2d3748;
+}
+
+    #resetSolverBtn:hover {
+        background-color: #d5d1ca;
+    }
+
+/* Output Containers */
+.output-container {
+    background-color: #FBF9F1;
+    border: 1px solid #E5E1DA;
+    border-radius: 0.5rem;
+    min-height: 300px;
+    max-height: 500px;
+    overflow-y: auto;
+    padding: 1rem;
+    font-family: 'Courier New', Courier, monospace;
+    font-size: 0.9rem;
+    line-height: 1.5;
+    color: #2d3748;
+    white-space: pre-wrap;
+}
+
+/* Sensitivity Analysis Buttons */
+.sensitivity-btn {
+    background-color: #AAD7D9; /* Light teal */
+    color: #2d3748; /* Dark gray text */
+    border: none;
+    border-radius: 0.375rem;
+    padding: 0.5rem 1rem;
+    font-size: 0.875rem;
+    text-align: center;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s ease;
+    margin: 0.25rem;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+}
+
+.sensitivity-btn:hover {
+    background-color: #92C7CF; /* Darker teal */
+    transform: translateY(-2px);
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
+
+.sensitivity-btn i {
+    margin-right: 0.5rem;
+    color: #2b6cb0; /* Blue icon */
+}
+
+/* File Preview */
+#filePreview {
+    background-color: #FBF9F1;
+    padding: 1rem;
+    border-radius: 0.375rem;
+    border: 1px solid #E5E1DA;
+    font-family: 'Courier New', Courier, monospace;
+    font-size: 0.9rem;
+    line-height: 1.5;
+    color: #2d3748;
+}
+
+/* Responsive Adjustments */
+@media (max-width: 768px) {
+    header h1 {
+        font-size: 2rem;
+    }
+
+    header p {
+        font-size: 1rem;
+    }
+
+    .tab-btn {
+        padding: 0.75rem;
+        font-size: 0.875rem;
+    }
+}
+
+/* Status Indicators */
+.text-red-500 {
+    color: #e53e3e;
+}
+
+.text-green-500 {
+    color: #38a169;
+}
+
+/* Loading Spinner */
+.fa-spinner {
+    animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+    0% {
+        transform: rotate(0deg);
+    }
+
+    100% {
+        transform: rotate(360deg);
+    }
+}
+
+/* Footer */
+footer {
+    margin-top: 3rem;
+    padding: 1rem;
+    color: #718096;
+    font-size: 0.875rem;
+}
+
+/* Example input formatting */
+.font-mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+}
+
+.bg-gray-100 {
+    background-color: #f3f4f6;
+}
+
+.text-blue-600 {
+    color: #2563eb;
+}
+
+/* Formatting for code elements */
+code {
+    background-color: #e5e7eb;
+    padding: 0.1rem 0.3rem;
+    border-radius: 0.25rem;
+    font-size: 0.9em;
+}
+
+/* Hover effect for example sections */
+.bg-gray-100:hover {
+    background-color: #e5e7eb;
+    transition: background-color 0.2s;
+}
+
+/* Override sensitivity buttons - Blue theme */
+.sensitivity-btn {
+    background-color: #AAD7D9 !important; /* Your light teal */
+    color: #2d3748 !important; /* Dark text */
+    border: none !important;
+}
+
+.sensitivity-btn:hover {
+    background-color: #92C7CF !important; /* Your darker teal */
+    color: #2d3748 !important;
+}
+
+.sensitivity-btn i {
+    color: #2b6cb0 !important; /* Blue icon */
+}

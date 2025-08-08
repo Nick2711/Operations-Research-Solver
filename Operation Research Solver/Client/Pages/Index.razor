@@ -53,13 +53,30 @@
                             </div>
                         </div>
 
+                        @* example block *@
                         <div class="flex-1">
                             <h3 class="text-lg font-medium text-gray-800 mb-3">File Format Example</h3>
-                            <div class="bg-gray-100 p-4 rounded-lg"></div>
+                            <div class="bg-gray-100 p-4 rounded-lg font-mono text-sm">
+                                <div class="text-blue-600 font-semibold mb-1"># Objective function (max/min and coefficients)</div>
+                                <div class="ml-4 mb-3">max +2 +3 +3 +5 +2 +4</div>
+
+                                <div class="text-blue-600 font-semibold mb-1"># Constraints (one per line)</div>
+                                <div class="ml-4 mb-3">+11 +8 +6 +14 +10 +10 &lt;= 40</div>
+                                <div class="ml-4 mb-3">+5 +2 +9 +0 +7 +3 &lt;= 25 <span class="text-gray-500 ml-2"># Optional additional constraints</span></div>
+
+                                <div class="text-blue-600 font-semibold mb-1"># Variable restrictions (last line)</div>
+                                <div class="ml-4">bin bin bin bin bin bin</div>
+                            </div>
+
                             <div class="mt-4 text-sm text-gray-600">
-                                <p class="mb-2"><span class="font-medium">First line:</span> Problem type (min/max) and objective coefficients</p>
-                                <p class="mb-2"><span class="font-medium">Middle lines:</span> Constraints (coefficients, operator, RHS)</p>
-                                <p><span class="font-medium">Last line:</span> Variable restrictions (+, -, int, bin, urs)</p>
+                                <p class="mb-2"><span class="font-medium">Format Rules:</span></p>
+                                <ul class="list-disc pl-5 space-y-1">
+                                    <li>First line: Problem type (<code>max</code>/<code>min</code>) and objective coefficients</li>
+                                    <li>Middle lines: Constraints (coefficients, operator <code> &lt;=</code> <code>=</code> <code>&gt;=</code>, RHS)</li>
+                                    <li>Last line: Variable restrictions (<code>+</code>, <code>-</code>, <code>int</code>, <code>bin</code>, <code>urs</code>)</li>
+                                    <li>Separate all values with spaces</li>
+                                    <li>Comments can be added with <code>#</code></li>
+                                </ul>
                             </div>
                         </div>
                     </div>
@@ -207,7 +224,7 @@
 
     <!-- Footer -->
     <footer class="mt-12 text-center text-gray-500 text-sm">
-        <p>Linear Programming Solver &copy; 2023 | Created for Operations Research</p>
+        <p>Linear Programming Solver &copy; 2025 | Created for Operations Research</p>
     </footer>
 </div>
 
