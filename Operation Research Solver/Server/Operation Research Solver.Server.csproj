@@ -15,6 +15,7 @@
   <ItemGroup>
     <ProjectReference Include="..\Client\Operation Research Solver.Client.csproj" />
     <ProjectReference Include="..\Shared\Operation Research Solver.Shared.csproj" />
+	  <ProjectReference Include="..\Solver.Engine\Solver.Engine.csproj" />
   </ItemGroup>
 
 </Project>

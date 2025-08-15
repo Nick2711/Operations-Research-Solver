@@ -1,0 +1,138 @@
+@page "/solver"
+@using Shared.Models
+@inject HttpClient Http
+@inject IJSRuntime JS
+@using Shared.Models
+@using Microsoft.AspNetCore.Components.Forms
+
+
+<h3 class="mb-3">LP/IP Solver (Server API)</h3>
+
+<div class="flex gap-3 items-center mb-3">
+    <InputFile OnChange="OnFileChange" />
+    <select @bind="selectedAlgo" class="border rounded px-2 py-1">
+        <option>Primal Simplex</option>
+        <option>Revised Simplex</option>
+        @* later: <option>B&B Simplex</option> <option>Gomory Cuts</option> <option>Knapsack B&B</option> *@
+    </select>
+    <label class="ml-2">
+        <input type="checkbox" @bind="verbose" /> Verbose logs
+    </label>
+    <button class="border rounded px-3 py-1" @onclick="Run" disabled="@(!hasFile || running)">
+        @(running ? "Solving..." : "Run")
+    </button>
+    <button class="border rounded px-3 py-1" @onclick="Download" disabled="@(string.IsNullOrEmpty(outputText))">
+        Download output.txt
+    </button>
+</div>
+
+@if (!string.IsNullOrEmpty(status))
+{
+    <div>@status</div>
+}
+@if (!string.IsNullOrEmpty(error))
+{
+    <div style="color:#b00020">@error</div>
+}
+@if (!string.IsNullOrEmpty(outputText))
+{
+    <pre style="white-space:pre-wrap; background:#0b1220; color:#cfe3ff; padding:1rem; border-radius:8px; overflow:auto; max-height:65vh;">
+@outputText
+    </pre>
+}
+
+@code {
+    string? inputText;
+    bool hasFile;
+    bool running;
+    bool verbose = true;
+    string selectedAlgo = "Primal Simplex";
+    string? outputText;
+    string? error;
+    string? status;
+
+    async Task OnFileChange(InputFileChangeEventArgs e)
+    {
+        error = null;
+        outputText = null;
+        status = null;
+
+        try
+        {
+            var file = e.File;
+            using var stream = file.OpenReadStream(long.MaxValue);
+            using var reader = new StreamReader(stream);
+            inputText = await reader.ReadToEndAsync();
+            hasFile = !string.IsNullOrWhiteSpace(inputText);
+        }
+        catch (Exception ex)
+        {
+            error = $"Failed to read file: {ex.Message}";
+            hasFile = false;
+        }
+    }
+
+    async Task Run()
+    {
+        if (string.IsNullOrWhiteSpace(inputText)) return;
+
+        running = true; error = null; outputText = null;
+        status = "Uploading model and solving...";
+        StateHasChanged();
+
+        try
+        {
+            var req = new SolveRequest
+            {
+                Algorithm = selectedAlgo,
+                ModelText = inputText!,
+                Settings = new SolveSettings
+                {
+                    Verbose = verbose,
+                    MaxIterations = 5000,
+                    MaxNodes = 2000,
+                    TimeLimitSeconds = 60
+                }
+            };
+
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(70));
+            var resMsg = await Http.PostAsJsonAsync("api/solve", req, cts.Token);
+            if (!resMsg.IsSuccessStatusCode)
+            {
+                var txt = await resMsg.Content.ReadAsStringAsync(cts.Token);
+                error = $"Server error ({(int)resMsg.StatusCode}): {txt}";
+                status = null;
+            }
+            else
+            {
+                var body = await resMsg.Content.ReadFromJsonAsync<SolveResponse>(cancellationToken: cts.Token);
+                outputText = body?.OutputText;
+                status = body is null ? null : $"Done in {body.RuntimeMs} ms";
+                if (body is { Success: false } && string.IsNullOrEmpty(error))
+                    error = "Solve did not succeed (see output).";
+            }
+        }
+        catch (TaskCanceledException)
+        {
+            error = "Request timed out.";
+            status = null;
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            status = null;
+        }
+        finally
+        {
+            running = false;
+        }
+    }
+
+    async Task Download()
+    {
+        if (string.IsNullOrEmpty(outputText)) return;
+        var bytes = System.Text.Encoding.UTF8.GetBytes(outputText);
+        var b64 = Convert.ToBase64String(bytes);
+        await JS.InvokeVoidAsync("downloadFile", "output.txt", "text/plain", b64);
+    }
+}
