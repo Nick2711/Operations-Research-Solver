@@ -1,13 +1,13 @@
 ﻿using System.Diagnostics;
 using System.Text;
+using System.Text.RegularExpressions;           // << add this
 using Microsoft.AspNetCore.Mvc;
 using Shared.Models;
 
 using Solver.Engine.IO;
 using Solver.Engine.Simplex;
-// ^ keep your other engine usings if needed
 
-namespace Server.Controllers   // keep this simple; analyzer warnings are harmless
+namespace Server.Controllers
 {
     [ApiController]
     [Route("api/[controller]")]
@@ -30,11 +30,37 @@ namespace Server.Controllers   // keep this simple; analyzer warnings are harmle
                 cts.CancelAfter(TimeSpan.FromSeconds(req.Settings.TimeLimitSeconds));
             var token = cts.Token;
 
+            // ----------- sanitize/normalize input lines -----------
+            // 1) unify newlines
+            var rawLines = (req.ModelText ?? string.Empty)
+                .Replace("\r\n", "\n")
+                .Split('\n');
+
+            // 2) strip comments and squeeze whitespace
+            static string Clean(string s) => Regex.Replace(s, @"\s+", " ").Trim();
+
+            var cleaned = rawLines
+                .Select(l => l.Split('#')[0])                                  // strip comments after '#'
+                .Select(Clean)                                                 // collapse whitespace
+                .Where(l => l.Length > 0)                                      // drop empties
+                .Select(l => Regex.Replace(l, @"\s*(<=|>=|=)\s*", " $1 "))     // ensure spaces around <=, >=, =
+                .ToArray();
+
+            if (cleaned.Length < 2)
+            {
+                sw.Stop();
+                return BadRequest(new SolveResponse
+                {
+                    OutputText = "Error: Not enough lines after cleaning.",
+                    RuntimeMs = sw.ElapsedMilliseconds
+                });
+            }
+            // ------------------------------------------------------
+
             try
             {
-                // Parse text -> model
-                var lines = req.ModelText.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-                var parsed = ModelParser.Parse(lines);
+                // Parse text -> model (use cleaned)
+                var parsed = ModelParser.Parse(cleaned);
 
                 if (parsed == null || parsed.Model == null)
                 {
@@ -47,11 +73,11 @@ namespace Server.Controllers   // keep this simple; analyzer warnings are harmle
                     });
                 }
 
-                // Pick solver from enum (no strings, no ??)
+                // Pick solver from enum
                 ISolver solver = req.Algorithm switch
                 {
                     Algorithm.PrimalSimplex => new PrimalSimplexSolver(),
-                    Algorithm.RevisedSimplex => new RevisedSimplexSolverStub(), // swap when you implement
+                    Algorithm.RevisedSimplex => new RevisedSimplexSolverStub(),   // replace when implemented
                     _ => new PrimalSimplexSolver()
                 };
 
@@ -67,11 +93,11 @@ namespace Server.Controllers   // keep this simple; analyzer warnings are harmle
 
                 if (result.Log != null)
                 {
-                    // Respect verbosity but avoid method-group/pattern pitfalls
                     var linesToShow = (req.Settings?.Verbose ?? true)
                         ? result.Log
                         : result.Log.Take(10);
-                    foreach (var l in linesToShow) outText.AppendLine(l);
+                    foreach (var l in linesToShow)
+                        outText.AppendLine(l);
                 }
 
                 outText.AppendLine();
@@ -111,7 +137,13 @@ namespace Server.Controllers   // keep this simple; analyzer warnings are harmle
             catch (Exception ex)
             {
                 sw.Stop();
-                return BadRequest(new SolveResponse { OutputText = $"Error: {ex.Message}", RuntimeMs = sw.ElapsedMilliseconds });
+                // include cleaned lines to help debug formatting issues
+                var dbg = string.Join("\n", cleaned.Select((l, i) => $"{i}: {l}"));
+                return BadRequest(new SolveResponse
+                {
+                    OutputText = $"Error: {ex.Message}\n\n[Cleaned lines]\n{dbg}",
+                    RuntimeMs = sw.ElapsedMilliseconds
+                });
             }
         }
     }
