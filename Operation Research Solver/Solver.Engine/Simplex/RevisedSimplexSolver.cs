@@ -1,6 +1,6 @@
 using Solver.Engine.Core;
 
-namespace Solver.Enginer.Engine.Simplex;
+namespace Solver.Engine.Simplex;
 
 public sealed class RevisedSimplexSolverStub : ISolver
 {
@@ -9,3 +9,5 @@ public sealed class RevisedSimplexSolverStub : ISolver
     public SolverResult Solve(LpModel model)
         => new(false, 0, Array.Empty<double>(), new List<string> { "Revised Simplex not yet implemented." });
 }
+
+

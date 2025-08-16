@@ -1,7 +1,7 @@
 using System.Globalization;
 using Solver.Engine.Core;
 
-namespace Solver.Enginer.Engine.Simplex;
+namespace Solver.Engine.Simplex;
 
 public sealed class PrimalSimplexSolver : ISolver
 {
@@ -183,3 +183,5 @@ public sealed class PrimalSimplexSolver : ISolver
         return sb.ToString();
     }
 }
+
+

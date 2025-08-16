@@ -1,6 +1,6 @@
 using System.Globalization;
 
-namespace Solver.Enginer.Engine.IO;
+namespace Solver.Engine.IO;
 
 public static class OutputWriter
 {
@@ -14,3 +14,5 @@ public static class OutputWriter
         }
     }
 }
+
+

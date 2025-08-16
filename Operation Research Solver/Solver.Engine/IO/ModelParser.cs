@@ -1,7 +1,7 @@
 using System.Globalization;
 using Solver.Engine.Core;
 
-namespace Solver.Enginer.Engine.IO;
+namespace Solver.Engine.IO;
 
 public static class ModelParser
 {
@@ -131,3 +131,5 @@ public static class ModelParser
         _ => throw new InvalidOperationException($"Invalid sign restriction: {s}")
     };
 }
+
+

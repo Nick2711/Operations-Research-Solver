@@ -1,6 +1,6 @@
-using Solver.Engine.Core;
+//using Solver.Engine.Core;
 
-namespace Solver.Enginer.Engine.Core;
+namespace Solver.Engine.Core;
 
 public static class Canonicalizer
 {
@@ -133,3 +133,5 @@ public static class Canonicalizer
         return new Result(new CanonicalForm(A, b.ToArray(), c, 0.0, basic, nonBasic));
     }
 }
+
+

@@ -1,6 +1,8 @@
 // Solver.Engine/Integer/BranchAndBound.cs
-namespace Solver.Enginer.Engine.Integer;
+namespace Solver.Engine.Integer;
 public sealed class BranchAndBound
 {
     // TODO: generic B&B framework
 }
+
+

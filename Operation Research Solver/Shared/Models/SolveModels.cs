@@ -1,19 +1,25 @@
-﻿// Shared/Models/SolveModels.cs
-namespace Shared.Models;
+﻿namespace Shared.Models;
+
+public enum Algorithm
+{
+    PrimalSimplex,
+    RevisedSimplex,
+    // add more later...
+}
 
 public sealed class SolveRequest
 {
-    public string Algorithm { get; set; } = "Primal Simplex";
+    public Algorithm Algorithm { get; set; } = Algorithm.PrimalSimplex;
     public string ModelText { get; set; } = "";
     public SolveSettings Settings { get; set; } = new();
 }
 
 public sealed class SolveSettings
 {
-    public int MaxIterations { get; set; } = 5000;    // for simplex/revised (hook up when you expose in engine)
-    public int MaxNodes { get; set; } = 2000;         // for B&B (hook up later)
-    public bool Verbose { get; set; } = true;         // show all tableaux/logs
-    public int TimeLimitSeconds { get; set; } = 60;   // server-side time limit
+    public int MaxIterations { get; set; } = 5000;
+    public int MaxNodes { get; set; } = 2000;
+    public bool Verbose { get; set; } = true;
+    public int TimeLimitSeconds { get; set; } = 60;
 }
 
 public sealed class SolveResponse

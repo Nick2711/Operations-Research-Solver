@@ -1,78 +1,118 @@
-﻿using Microsoft.AspNetCore.Mvc;
+﻿using System.Diagnostics;
+using System.Text;
+using Microsoft.AspNetCore.Mvc;
 using Shared.Models;
-using Solver.Engine.Core;
+
 using Solver.Engine.IO;
 using Solver.Engine.Simplex;
-using System.Diagnostics;
+// ^ keep your other engine usings if needed
 
-namespace Server.Controllers;
-
-[ApiController]
-[Route("api/[controller]")]
-public class SolveController : ControllerBase
+namespace Server.Controllers   // keep this simple; analyzer warnings are harmless
 {
-    [HttpPost]
-    public ActionResult<SolveResponse> Post([FromBody] SolveRequest req, CancellationToken ct)
+    [ApiController]
+    [Route("api/[controller]")]
+    public sealed class SolveController : ControllerBase
     {
-        var sw = Stopwatch.StartNew();
-
-        if (string.IsNullOrWhiteSpace(req.ModelText))
-            return BadRequest(new SolveResponse { OutputText = "Error: ModelText is empty." });
-
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        if (req.Settings.TimeLimitSeconds > 0)
-            cts.CancelAfter(TimeSpan.FromSeconds(req.Settings.TimeLimitSeconds));
-        var token = cts.Token;
-
-        try
+        [HttpPost]
+        public ActionResult<SolveResponse> Post([FromBody] SolveRequest req, CancellationToken ct)
         {
-            var lines = req.ModelText.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-            var parsed = ModelParser.Parse(lines);
+            var sw = Stopwatch.StartNew();
 
-            ISolver solver = req.Algorithm switch
+            if (req is null)
+                return BadRequest(new SolveResponse { OutputText = "Error: Request body is null." });
+
+            if (string.IsNullOrWhiteSpace(req.ModelText))
+                return BadRequest(new SolveResponse { OutputText = "Error: ModelText is empty." });
+
+            // Time limit
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            if (req.Settings != null && req.Settings.TimeLimitSeconds > 0)
+                cts.CancelAfter(TimeSpan.FromSeconds(req.Settings.TimeLimitSeconds));
+            var token = cts.Token;
+
+            try
             {
-                "Primal Simplex" => new PrimalSimplexSolver(),
-                "Revised Simplex" => new RevisedSimplexSolverStub(), // replace with real impl later
-                // "B&B Simplex"   => new BranchAndBoundSimplex(...),
-                // "Gomory Cuts"   => new GomoryCuttingPlane(...),
-                // "Knapsack B&B"  => new KnapsackBranchAndBound(...),
-                _ => new PrimalSimplexSolver()
-            };
+                // Parse text -> model
+                var lines = req.ModelText.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                var parsed = ModelParser.Parse(lines);
 
-            token.ThrowIfCancellationRequested();
-            var res = solver.Solve(parsed.Model);
-            token.ThrowIfCancellationRequested();
+                if (parsed == null || parsed.Model == null)
+                {
+                    sw.Stop();
+                    return Ok(new SolveResponse
+                    {
+                        Success = false,
+                        OutputText = "Failed to parse model.",
+                        RuntimeMs = sw.ElapsedMilliseconds
+                    });
+                }
 
-            var logs = new List<string> { $"Algorithm: {solver.Name}" };
-            logs.AddRange(req.Settings.Verbose ? res.Log : res.Log.Take(10));
-            logs.Add(res.Success
-                ? $"SUCCESS — Objective: {res.ObjectiveValue:0.###}\nSolution: {string.Join(", ", res.X.Select((v, i) => $"x{i + 1}={v:0.###}"))}"
-                : res.Unbounded ? "FAILED — Unbounded."
-                : res.Infeasible ? "FAILED — Infeasible or needs Phase I."
-                : "FAILED — Unknown.");
+                // Pick solver from enum (no strings, no ??)
+                ISolver solver = req.Algorithm switch
+                {
+                    Algorithm.PrimalSimplex => new PrimalSimplexSolver(),
+                    Algorithm.RevisedSimplex => new RevisedSimplexSolverStub(), // swap when you implement
+                    _ => new PrimalSimplexSolver()
+                };
 
-            sw.Stop();
+                token.ThrowIfCancellationRequested();
 
-            return Ok(new SolveResponse
+                var result = solver.Solve(parsed.Model);
+
+                token.ThrowIfCancellationRequested();
+
+                // Build output text
+                var outText = new StringBuilder();
+                outText.AppendLine($"Algorithm: {solver.Name}");
+
+                if (result.Log != null)
+                {
+                    // Respect verbosity but avoid method-group/pattern pitfalls
+                    var linesToShow = (req.Settings?.Verbose ?? true)
+                        ? result.Log
+                        : result.Log.Take(10);
+                    foreach (var l in linesToShow) outText.AppendLine(l);
+                }
+
+                outText.AppendLine();
+                if (result.Success)
+                {
+                    outText.AppendLine($"SUCCESS — Objective: {result.ObjectiveValue:0.###}");
+                    if (result.X is { Length: > 0 })
+                        outText.AppendLine("Solution: " + string.Join(", ", result.X.Select((v, i) => $"x{i + 1}={v:0.###}")));
+                }
+                else
+                {
+                    outText.AppendLine(result.Unbounded ? "FAILED — Unbounded."
+                                   : result.Infeasible ? "FAILED — Infeasible (Phase I needed)."
+                                   : "FAILED — Unknown.");
+                }
+
+                sw.Stop();
+
+                return Ok(new SolveResponse
+                {
+                    Success = result.Success,
+                    Unbounded = result.Unbounded,
+                    Infeasible = result.Infeasible,
+                    Objective = result.Success ? Math.Round(result.ObjectiveValue, 3) : (double?)null,
+                    SolutionSummary = result.Success && result.X is { Length: > 0 }
+                        ? string.Join(", ", result.X.Select((v, i) => $"x{i + 1}={v:0.###}"))
+                        : null,
+                    OutputText = outText.ToString(),
+                    RuntimeMs = sw.ElapsedMilliseconds
+                });
+            }
+            catch (OperationCanceledException)
             {
-                Success = res.Success,
-                Unbounded = res.Unbounded,
-                Infeasible = res.Infeasible,
-                Objective = res.Success ? res.ObjectiveValue : null,
-                SolutionSummary = res.Success ? string.Join(", ", res.X.Select((v, i) => $"x{i + 1}={v:0.###}")) : null,
-                OutputText = string.Join(Environment.NewLine, logs),
-                RuntimeMs = sw.ElapsedMilliseconds
-            });
-        }
-        catch (OperationCanceledException)
-        {
-            sw.Stop();
-            return StatusCode(408, new SolveResponse { OutputText = "Timed out.", RuntimeMs = sw.ElapsedMilliseconds });
-        }
-        catch (Exception ex)
-        {
-            sw.Stop();
-            return BadRequest(new SolveResponse { OutputText = $"Error: {ex.Message}", RuntimeMs = sw.ElapsedMilliseconds });
+                sw.Stop();
+                return StatusCode(408, new SolveResponse { OutputText = "Timed out.", RuntimeMs = sw.ElapsedMilliseconds });
+            }
+            catch (Exception ex)
+            {
+                sw.Stop();
+                return BadRequest(new SolveResponse { OutputText = $"Error: {ex.Message}", RuntimeMs = sw.ElapsedMilliseconds });
+            }
         }
     }
 }

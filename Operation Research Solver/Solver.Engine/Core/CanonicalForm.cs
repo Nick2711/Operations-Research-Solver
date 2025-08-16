@@ -1,4 +1,4 @@
-namespace Solver.Enginer.Engine.Core;
+namespace Solver.Engine.Core;
 
 /// Canonical tableau form for Primal Simplex: Ax = b with x = 0 (after transforms),
 /// plus slack vars; objective in standard max form.
@@ -16,3 +16,5 @@ public sealed class CanonicalForm
         this.A = A; this.b = b; this.c = c; this.z0 = z0; BasicIdx = basic; NonBasicIdx = nonBasic;
     }
 }
+
+

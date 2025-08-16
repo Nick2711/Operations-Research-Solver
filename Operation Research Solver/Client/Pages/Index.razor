@@ -1,4 +1,7 @@
 ﻿@page "/"
+@using Shared.Models
+@using Microsoft.AspNetCore.Components.Forms
+@inject HttpClient Http
 @inject IJSRuntime JS
 
 <div class="container mx-auto px-4 py-8 max-w-6xl">
@@ -44,7 +47,8 @@
                                         <p class="text-sm text-gray-500 mb-4">.txt files only</p>
                                         <span class="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition">Select File</span>
                                     </div>
-                                    <input id="modelFile" type="file" accept=".txt" class="hidden">
+                                    <!-- Hidden input stays visually identical; now Blazor can read the file -->
+                                    <InputFile id="modelFile" class="hidden" accept=".txt" OnChange="HandleFile" />
                                 </label>
                             </div>
                             <div id="fileInfo" class="mt-4 text-sm text-gray-600 hidden">
@@ -85,7 +89,7 @@
                 <div id="filePreviewSection" class="hidden">
                     <h3 class="text-xl font-semibold text-gray-800 mb-3">File Preview</h3>
                     <div class="bg-gray-50 border border-gray-200 rounded-lg p-4">
-                        <pre id="filePreview" class="text-sm"></pre>
+                        <pre id="filePreview" class="text-sm">@(_modelText)</pre>
                     </div>
                 </div>
             </div>
@@ -109,15 +113,13 @@
                             <h3 class="text-lg font-medium text-gray-800 mb-3">Algorithm Selection</h3>
                             <div class="mb-4">
                                 <label for="algorithm" class="block text-sm font-medium text-gray-700 mb-1">Choose solving method:</label>
-                                <select id="algorithm" class="w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500">
-                                    <option value="primal">Primal Simplex</option>
-                                    <option value="revised">Revised Simplex</option>
-                                    <option value="branch_bound_simplex">Branch & Bound (Simplex)</option>
-                                    <option value="cutting_plane">Cutting Plane</option>
-                                    <option value="branch_bound_knapsack">Branch & Bound (Knapsack)</option>
+                                <select id="algorithm" class="w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500" @bind="request.Algorithm">
+                                    <option value="@Algorithm.PrimalSimplex">Primal Simplex</option>
+                                    <option value="@Algorithm.RevisedSimplex">Revised Simplex</option>
                                 </select>
                             </div>
-                            <button id="runSolverBtn" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-4 rounded-md transition flex items-center justify-center">
+                            <button id="runSolverBtn" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-4 rounded-md transition flex items-center justify-center"
+                                    @onclick="RunSolver">
                                 <i class="fas fa-play-circle mr-2"></i> Run Solver
                             </button>
                         </div>
@@ -128,16 +130,25 @@
                     <h3 class="text-xl font-semibold text-gray-800 mb-3">Solution Output</h3>
                     <div class="output-container bg-gray-50 border border-gray-200 rounded-lg p-4">
                         <div id="solverOutput" class="text-sm font-mono">
-                            <p class="text-gray-500 italic">Solution output will appear here after running the solver.</p>
+                            @if (string.IsNullOrWhiteSpace(_output))
+                            {
+                                <p class="text-gray-500 italic">Solution output will appear here after running the solver.</p>
+                            }
+                            else
+                            {
+                                <pre>@_output</pre>
+                            }
                         </div>
                     </div>
                 </div>
 
                 <div class="flex flex-wrap gap-3">
-                    <button id="downloadResultsBtn" class="bg-green-600 hover:bg-green-700 text-white font-medium py-2 px-4 rounded-md transition flex items-center disabled:opacity-50" disabled>
+                    <button id="downloadResultsBtn" class="bg-green-600 hover:bg-green-700 text-white font-medium py-2 px-4 rounded-md transition flex items-center disabled:opacity-50"
+                            @onclick="DownloadResults" disabled="@string.IsNullOrWhiteSpace(_output)">
                         <i class="fas fa-file-download mr-2"></i> Download Results
                     </button>
-                    <button id="resetSolverBtn" class="bg-gray-600 hover:bg-gray-700 text-white font-medium py-2 px-4 rounded-md transition flex items-center">
+                    <button id="resetSolverBtn" class="bg-gray-600 hover:bg-gray-700 text-white font-medium py-2 px-4 rounded-md transition flex items-center"
+                            @onclick="ResetSolver">
                         <i class="fas fa-redo mr-2"></i> Reset
                     </button>
                 </div>
@@ -152,7 +163,14 @@
                         <div class="bg-gray-50 p-4 rounded-lg border border-gray-200 mb-6">
                             <h3 class="text-lg font-medium text-gray-800 mb-3">Current Solution</h3>
                             <div id="currentSolution" class="text-sm">
-                                <p class="text-gray-500 italic">No solution available yet. Please solve a model first.</p>
+                                @if (string.IsNullOrWhiteSpace(_solutionSummary))
+                                {
+                                    <p class="text-gray-500 italic">No solution available yet. Please solve a model first.</p>
+                                }
+                                else
+                                {
+                                    <p>@_solutionSummary</p>
+                                }
                             </div>
                         </div>
 
@@ -160,6 +178,7 @@
                             <h3 class="text-lg font-medium text-gray-800 mb-3">Sensitivity Tools</h3>
                             <p class="text-sm text-gray-600 mb-4">Perform additional analysis on the solved model:</p>
                             <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                                <!-- (buttons unchanged; JS handles clicks/alerts if you use it later) -->
                                 <button class="sensitivity-btn bg-purple-100 hover:bg-purple-200 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center" data-analysis="range-nonbasic">
                                     <i class="fas fa-ruler-horizontal mr-2"></i> Range of Non-Basic Var
                                 </button>
@@ -229,12 +248,112 @@
 </div>
 
 @code {
+    // model text populated by either the Blazor file read OR your existing JS preview
+    private string _modelText = "";
+    private string _output = "";
+    private string _solutionSummary = "";
+
+    private SolveRequest request = new()
+        {
+            Algorithm = Algorithm.PrimalSimplex,
+            Settings = new SolveSettings
+            {
+                Verbose = true,
+                TimeLimitSeconds = 60,
+                MaxIterations = 5000
+            }
+        };
+
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
         if (firstRender)
         {
-            // Call your wrapper once the DOM is ready
             await JS.InvokeVoidAsync("initializeApp");
         }
+    }
+
+    // Capture uploaded file content (no visual change; input stays hidden)
+    private async Task HandleFile(InputFileChangeEventArgs e)
+    {
+        var file = e.File;
+        if (file is null) return;
+
+        using var stream = file.OpenReadStream(2 * 1024 * 1024);
+        using var reader = new StreamReader(stream);
+        _modelText = await reader.ReadToEndAsync();
+
+        // Keep SolveRequest in sync for the API
+        request.ModelText = _modelText;
+
+        StateHasChanged();
+    }
+
+    private async Task RunSolver()
+    {
+        // Fallback: if Blazor didn't read, try to grab JS preview text
+        if (string.IsNullOrWhiteSpace(request.ModelText))
+        {
+            try
+            {
+                var txt = await JS.InvokeAsync<string>("eval", "document.getElementById('filePreview')?.textContent || ''");
+                request.ModelText = txt ?? "";
+            }
+            catch { /* ignore */ }
+        }
+
+        if (string.IsNullOrWhiteSpace(request.ModelText))
+        {
+            await JS.InvokeVoidAsync("showAlert", "Please upload a model first.", "warning");
+            return;
+        }
+
+        _output = "Solving...";
+        StateHasChanged();
+
+        try
+        {
+            var resp = await Http.PostAsJsonAsync("api/solve", request);
+            if (!resp.IsSuccessStatusCode)
+            {
+                var err = await resp.Content.ReadAsStringAsync();
+                _output = $"Server error ({(int)resp.StatusCode}): {err}";
+                _solutionSummary = "";
+                StateHasChanged();
+                return;
+            }
+
+            var body = await resp.Content.ReadFromJsonAsync<SolveResponse>();
+            _output = body?.OutputText ?? "(no output)";
+            _solutionSummary = body?.SolutionSummary ?? "";
+            StateHasChanged();
+        }
+        catch (Exception ex)
+        {
+            _output = $"Error calling solver: {ex.Message}";
+            _solutionSummary = "";
+            StateHasChanged();
+        }
+    }
+
+    private void ResetSolver()
+    {
+        _modelText = "";
+        request.ModelText = "";
+        _output = "";
+        _solutionSummary = "";
+    }
+
+    private async Task DownloadResults()
+    {
+        if (string.IsNullOrWhiteSpace(_output))
+        {
+            await JS.InvokeVoidAsync("showAlert", "No results to download.", "warning");
+            return;
+        }
+
+        // Use a small JS helper (you already have download.js)
+        var bytes = System.Text.Encoding.UTF8.GetBytes(_output);
+        var b64 = Convert.ToBase64String(bytes);
+        await JS.InvokeVoidAsync("downloadFile", "lp_solution.txt", "text/plain", b64);
     }
 }

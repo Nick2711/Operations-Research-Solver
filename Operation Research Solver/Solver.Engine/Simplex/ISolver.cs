@@ -1,6 +1,6 @@
 using Solver.Engine.Core;
 
-namespace Solver.Enginer.Engine.Simplex;
+namespace Solver.Engine.Simplex;
 
 public interface ISolver
 {
@@ -25,3 +25,5 @@ public sealed class SolverResult
         Log = log ?? new();
     }
 }
+
+

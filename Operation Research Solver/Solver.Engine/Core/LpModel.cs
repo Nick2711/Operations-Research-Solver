@@ -1,4 +1,4 @@
-namespace Solver.Enginer.Engine.Core;
+namespace Solver.Engine.Core;
 
 public sealed class LpModel
 {
@@ -11,3 +11,5 @@ public sealed class LpModel
     public int NumVars => Variables.Count;
     public int NumConstraints => Constraints.Count;
 }
+
+

@@ -1,4 +1,4 @@
-namespace Solver.Enginer.Engine.Core;
+namespace Solver.Engine.Core;
 
 public sealed class Variable
 {
@@ -13,3 +13,5 @@ public sealed class Variable
         Sign = sign;
     }
 }
+
+
