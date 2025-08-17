@@ -9,6 +9,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Operation Research Solver.S
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Operation Research Solver.Shared", "Shared\Operation Research Solver.Shared.csproj", "{C51B03E8-FC5E-4E98-92CE-F3D275E6A122}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Solver.Engine", "Solver.Engine\Solver.Engine.csproj", "{041553ED-1340-4F81-973B-4789396A5B6B}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -30,5 +32,9 @@ Global
 		{C51B03E8-FC5E-4E98-92CE-F3D275E6A122}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{C51B03E8-FC5E-4E98-92CE-F3D275E6A122}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{C51B03E8-FC5E-4E98-92CE-F3D275E6A122}.Release|Any CPU.Build.0 = Release|Any CPU
+		{041553ED-1340-4F81-973B-4789396A5B6B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{041553ED-1340-4F81-973B-4789396A5B6B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{041553ED-1340-4F81-973B-4789396A5B6B}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{041553ED-1340-4F81-973B-4789396A5B6B}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 EndGlobal

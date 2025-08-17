@@ -1,187 +1,351 @@
+using System;
+using System.Collections.Generic;
 using System.Globalization;
+using System.Linq;
+using System.Text;
 using Solver.Engine.Core;
 
-namespace Solver.Engine.Simplex;
-
-public sealed class PrimalSimplexSolver : ISolver
+namespace Solver.Engine.Simplex
 {
-    public string Name => "Primal Simplex (Tableau)";
-
-    public SolverResult Solve(LpModel model)
+    public sealed class PrimalSimplexSolver : ISolver
     {
-        var log = new List<string>();
-        Canonicalizer.Result canoRes;
-        try
+        public string Name => "Primal Simplex (Tableau)";
+
+        private const double EPS = 1e-9;
+        private const int MAX_ITERS = 10000;
+
+        public SolverResult Solve(LpModel model)
         {
-            canoRes = Canonicalizer.ToCanonical(model);
-        }
-        catch (NotSupportedException e)
-        {
-            log.Add($"Canonicalization requires Phase I for this model: {e.Message}");
-            return new SolverResult(false, 0, Array.Empty<double>(), log, infeasible: true);
-        }
+            var log = new List<string>();
 
-        var cf = canoRes.Canonical;
+            // 1) Canonicalize
+            var canRes = Canonicalizer.ToCanonical(model);
+            var can = canRes.Canonical;
 
-        // Build initial tableau:
-        // Rows: m constraints + 1 objective
-        // Cols: n variables + 1 RHS
-        int m = cf.b.Length;
-        int n = cf.c.Length;
-        double[,] T = new double[m + 1, n + 1];
+            int m = can.A.GetLength(0);     // constraints
+            int n = can.A.GetLength(1);     // total cols (decisions + slacks)
+            int p = model.NumVars;          // decision variables count
+            int width = n + 1;              // + RHS
 
-        // Constraint rows
-        for (int i = 0; i < m; i++)
-        {
-            for (int j = 0; j < n; j++) T[i, j] = cf.A[i, j];
-            T[i, n] = cf.b[i];
-        }
-
-        // Objective row: z - c^T x = 0  => coefficients = -c
-        for (int j = 0; j < n; j++) T[m, j] = -cf.c[j];
-        T[m, n] = cf.z0;
-
-        int[] basic = (int[])cf.BasicIdx.Clone();
-        int[] nonBasic = (int[])cf.NonBasicIdx.Clone();
-
-        log.Add(RenderTableau(T, basic, nonBasic, "Initial tableau"));
-
-        // Iterate
-        while (true)
-        {
-            // Entering variable: column with most positive reduced cost in objective row (since we maximize)
-            int enter = ArgMaxPositive(T, m, n);
-            if (enter == -1)
+            // 2) Build tableau (m+1) x (n+1)
+            var T = new double[m + 1, n + 1];
+            for (int i = 0; i < m; i++)
             {
-                // Optimal
-                var x = RecoverX(n, basic, T, m);
-                double z = T[m, n];
-                log.Add($"Optimal reached. z = {z.ToString("0.###", CultureInfo.InvariantCulture)}");
-                // Map back to original variables length (relaxation; integers handled elsewhere)
-                var xOrig = BackProjectToOriginal(model, cf, basic, T, m);
-                return new SolverResult(true, z, xOrig, log);
+                for (int j = 0; j < n; j++) T[i + 1, j] = can.A[i, j];
+                T[i + 1, n] = can.b[i];
+            }
+            for (int j = 0; j < n; j++) T[0, j] = -can.c[j];
+            T[0, n] = can.z0;
+
+            // 3) Basis (verify identity; else detect)
+            var basis = (can.BasicIdx ?? Array.Empty<int>()).ToArray();
+            if (!IsValidIdentityBasis(T, basis, m, n)) basis = DetectIdentityBasis(T, m, n);
+            if (!IsValidIdentityBasis(T, basis, m, n))
+            {
+                log.Add("No valid initial identity basis; Phase I required.");
+                return new SolverResult(false, 0, Array.Empty<double>(), log, infeasible: true);
+            }
+            var basicSet = new HashSet<int>(basis);
+
+            // 4) Canonicalize z-row: z := z + Î£ c_b * row_b
+            for (int r = 0; r < m; r++)
+            {
+                double cb = can.c[basis[r]];
+                if (Math.Abs(cb) > EPS) AddScaledRow(T, 0, r + 1, cb, width);
             }
 
-            // Leaving variable: min ratio test b_i / a_i_enter with a_i_enter > 0
-            int leave = MinRatioRow(T, m, n, enter);
-            if (leave == -1)
+            // 5) Optional: print canonical form like your sheet
+            log.Add(RenderCanonicalForm(can.A, can.b, can.c, p));
+
+            // INITIAL DISPLAY (t-1): compute entering+theta for display before first pivot
+            int enter = FindEntering(T, basicSet, n);
+            var thetaDisp = ComputeThetaColumn(T, enter, m, n);
+            log.Add(RenderTableauWithTheta("t-1", T, m, n, basis, p, enter, thetaDisp));
+
+            int iter = 0;
+            while (iter++ < MAX_ITERS)
             {
-                log.Add("Problem is unbounded in the direction of the entering variable.");
-                return new SolverResult(false, double.NaN, Array.Empty<double>(), log, unbounded: true);
-            }
-
-            // Pivot
-            Pivot(T, m, n, leave, enter);
-
-            // Swap basis indices
-            (basic[leave], nonBasic[Array.IndexOf(nonBasic, enter)]) = (enter, basic[leave]);
-
-            log.Add(RenderTableau(T, basic, nonBasic, $"Pivot r{leave} c{enter}"));
-        }
-    }
-
-    private static int ArgMaxPositive(double[,] T, int m, int n)
-    {
-        int col = -1; double best = 1e-12; // positive threshold
-        for (int j = 0; j < n; j++)
-        {
-            double rc = T[m, j];
-            if (rc > best) { best = rc; col = j; }
-        }
-        return col;
-    }
-
-    private static int MinRatioRow(double[,] T, int m, int n, int enter)
-    {
-        int row = -1; double best = double.PositiveInfinity;
-        for (int i = 0; i < m; i++)
-        {
-            double a = T[i, enter];
-            if (a > 1e-12)
-            {
-                double ratio = T[i, n] / a;
-                if (ratio < best - 1e-12)
+                // Actual entering for this iteration
+                enter = FindEntering(T, basicSet, n);
+                if (enter == -1)
                 {
-                    best = ratio; row = i;
+                    // Optimal
+                    double z = T[0, n];
+                    var xFull = ExtractPrimal(T, m, n, basis);
+                    var xDecision = xFull.Take(Math.Min(model.NumVars, xFull.Length)).ToArray();
+                    log.Add("Optimality reached.");
+                    return new SolverResult(true, z, xDecision, log);
+                }
+
+                // Leaving: standard ratio test with a_ij > 0
+                int leave = -1;
+                double minRatio = double.PositiveInfinity;
+                for (int r = 0; r < m; r++)
+                {
+                    double a = T[r + 1, enter];
+                    if (a > EPS)
+                    {
+                        double ratio = T[r + 1, n] / a;
+                        if (ratio < minRatio - EPS ||
+                            (Math.Abs(ratio - minRatio) <= EPS && (leave == -1 || basis[r] > basis[leave])))
+                        {
+                            minRatio = ratio;
+                            leave = r;
+                        }
+                    }
+                }
+                if (leave == -1)
+                {
+                    log.Add($"Unbounded: entering x{enter + 1} has no positive entries.");
+                    return new SolverResult(false, 0, Array.Empty<double>(), log, unbounded: true);
+                }
+
+                // Pivot
+                Pivot(T, leave + 1, enter, width);
+                basicSet.Remove(basis[leave]);
+                basis[leave] = enter;
+                basicSet.Add(enter);
+
+                // AFTER-PIVOT DISPLAY (your second block shows the new tableau with next Î¸)
+                int nextEnter = FindEntering(T, basicSet, n);
+                var thetaNext = ComputeThetaColumn(T, nextEnter, m, n);
+                log.Add(RenderTableauWithTheta("t-1", T, m, n, basis, p, nextEnter, thetaNext));
+            }
+
+            log.Add("Max iterations exceeded.");
+            return new SolverResult(false, 0, Array.Empty<double>(), log);
+        }
+
+
+        // ===== helpers =====
+        private static int FindEntering(double[,] T, HashSet<int> basicSet, int n)
+        {
+            int enter = -1;
+            double best = 0.0;
+            for (int j = 0; j < n; j++)
+            {
+                if (basicSet.Contains(j)) continue;
+                double rc = T[0, j];
+                if (rc < best - EPS) { best = rc; enter = j; }
+            }
+            return enter;
+        }
+
+        private static double[] ComputeThetaColumn(double[,] T, int enter, int m, int n)
+        {
+            var theta = new double[m];
+            if (enter < 0) return theta; // all zeros when optimal (matches your final block)
+            for (int r = 0; r < m; r++)
+            {
+                double a = T[r + 1, enter];
+                if (Math.Abs(a) < EPS) theta[r] = double.NaN;    // print blank
+                else theta[r] = T[r + 1, n] / a;                 // allow negatives, like your -16
+            }
+            return theta;
+        }
+
+        private static string RenderCanonicalForm(double[,] A, double[] b, double[] c, int numVars)
+        {
+            var I = System.Globalization.CultureInfo.InvariantCulture;
+            var sb = new StringBuilder();
+            sb.AppendLine("Canonical form");
+            // z - c^T x = 0
+            sb.Append("z");
+            for (int j = 0; j < numVars; j++)
+            {
+                double cj = -c[j];
+                sb.Append(" ").Append(SignTerm(cj)).Append(VarTerm(Math.Abs(cj), $"x{j + 1}", I));
+            }
+            sb.Append(" = 0").AppendLine();
+
+            // constraints with slacks s1..sm appended
+            int m = A.GetLength(0);
+            int n = A.GetLength(1);
+            for (int i = 0; i < m; i++)
+            {
+                var row = new StringBuilder();
+                bool first = true;
+                for (int j = 0; j < numVars; j++)
+                {
+                    double a = A[i, j];
+                    if (Math.Abs(a) < EPS) continue;
+                    row.Append(first ? "" : " ").Append(SignTerm(a)).Append(VarTerm(Math.Abs(a), $"x{j + 1}", I));
+                    first = false;
+                }
+                // + s_i
+                row.Append(first ? "" : " ").Append("+ ").Append($"s{i + 1}");
+                row.Append(" = ").Append(b[i].ToString("0.###", I));
+                sb.Append("  ");                       // spacing
+                sb.Append($"c{i + 1}: ");              // label
+                sb.AppendLine(row.ToString());
+
+            }
+            return sb.ToString();
+        }
+
+        private static string SignTerm(double v) => (v < -EPS) ? "- " : "+ ";
+        private static string VarTerm(double coef, string name, System.Globalization.CultureInfo I)
+        {
+            if (Math.Abs(coef - 1.0) < EPS) return name;
+            return coef.ToString("0.###", I) + name;
+        }
+
+        private static string F(double v)
+        {
+            // avoid -0; keep 0.### formatting
+            if (Math.Abs(v) < EPS) v = 0.0;
+            return v.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        private static string RenderTableauWithTheta(
+            string title, double[,] T, int m, int n, int[] basis, int numVars, int enterCol, double[] theta)
+        {
+            var I = System.Globalization.CultureInfo.InvariantCulture;
+            var sb = new StringBuilder();
+            sb.AppendLine(title);
+
+            // headers: x1..x_numVars, then s1..s_m, RHS, theta
+            sb.Append("Basic |");
+            for (int j = 0; j < numVars; j++) sb.Append($" x{j + 1}\t");
+            for (int j = 0; j < m; j++) sb.Append($" s{j + 1}\t");
+            sb.Append("RHS\tÎ¸");
+            sb.AppendLine();
+
+            // z-row first
+            sb.Append(" z    |");
+            for (int j = 0; j < numVars; j++) sb.Append(F(T[0, j])).Append('\t');
+            for (int j = 0; j < m; j++) sb.Append(F(T[0, numVars + j])).Append('\t');
+            sb.Append(F(T[0, n])).Append("\t"); // RHS of z
+            sb.AppendLine();
+            sb.AppendLine(new string('-', 60));
+
+            // constraint rows
+            for (int i = 0; i < m; i++)
+            {
+                string bcol = (i < basis.Length && basis[i] >= 0)
+                    ? ((basis[i] < numVars) ? $"x{basis[i] + 1}" : $"s{basis[i] - numVars + 1}")
+                    : " ? ";
+
+                sb.Append($"{($"c{i + 1}"),5} |");
+
+                // decision columns
+                for (int j = 0; j < numVars; j++) sb.Append(F(T[i + 1, j])).Append('\t');
+
+                // slack columns
+                for (int j = 0; j < m; j++) sb.Append(F(T[i + 1, numVars + j])).Append('\t');
+
+                // RHS
+                sb.Append(F(T[i + 1, n])).Append('\t');
+
+                // theta (RHS / a_Â·,enter); blank if NaN or no entering col
+                if (enterCol >= 0)
+                {
+                    double th = theta[i];
+                    sb.Append(double.IsNaN(th) ? "" : F(th));
+                }
+
+                sb.AppendLine();
+            }
+
+            return sb.ToString();
+        }
+
+        private static bool IsValidIdentityBasis(double[,] T, int[] basis, int m, int n)
+        {
+            if (basis == null || basis.Length != m) return false;
+            for (int r = 0; r < m; r++)
+            {
+                int j = basis[r];
+                if (j < 0 || j >= n) return false;
+                if (Math.Abs(T[r + 1, j] - 1.0) > EPS) return false;
+                for (int rr = 0; rr < m; rr++)
+                    if (rr != r && Math.Abs(T[rr + 1, j]) > EPS) return false;
+            }
+            return true;
+        }
+
+        private static int[] DetectIdentityBasis(double[,] T, int m, int n)
+        {
+            var b = Enumerable.Repeat(-1, m).ToArray();
+            for (int r = 0; r < m; r++)
+            {
+                for (int j = 0; j < n; j++)
+                {
+                    if (Math.Abs(T[r + 1, j] - 1.0) > EPS) continue;
+                    bool ok = true;
+                    for (int rr = 0; rr < m; rr++)
+                        if (rr != r && Math.Abs(T[rr + 1, j]) > EPS) { ok = false; break; }
+                    if (ok) { b[r] = j; break; }
                 }
             }
+            return b;
         }
-        return row;
-    }
 
-    private static void Pivot(double[,] T, int m, int n, int pivRow, int pivCol)
-    {
-        double piv = T[pivRow, pivCol];
-        // Normalize pivot row
-        for (int j = 0; j <= n; j++) T[pivRow, j] /= piv;
-
-        // Eliminate pivot column from other rows (including objective)
-        for (int i = 0; i <= m; i++)
+        private static void AddScaledRow(double[,] T, int target, int src, double factor, int width)
         {
-            if (i == pivRow) continue;
-            double factor = T[i, pivCol];
-            if (Math.Abs(factor) < 1e-12) continue;
-            for (int j = 0; j <= n; j++)
-                T[i, j] -= factor * T[pivRow, j];
+            for (int j = 0; j < width; j++) T[target, j] += factor * T[src, j];
         }
-    }
 
-    private static double[] RecoverX(int n, int[] basic, double[,] T, int m)
-    {
-        var x = new double[n];
-        for (int i = 0; i < m; i++)
+        private static void ScaleRow(double[,] T, int row, double factor, int width)
         {
-            int varIdx = basic[i];
-            x[varIdx] = T[i, n];
+            for (int j = 0; j < width; j++) T[row, j] *= factor;
         }
-        return x;
-    }
 
-    private static double[] BackProjectToOriginal(LpModel model, CanonicalForm cf, int[] basic, double[,] T, int m)
-    {
-        // For now, if we only performed sign-expansions, we can reconstruct the first “newVarCount”
-        // components (before slacks). Then compress back to original |Variables|.
-        int n = cf.c.Length;
-        var fullX = RecoverX(n, basic, T, m);
-
-        // Identify how many came from original vars (before adding slacks)
-        int newVarCount = n - m;
-
-        // We don’t carry the explicit mapping forward from Canonicalizer here to keep code short.
-        // For Phase 1 skip, we assumed:
-        //   - Plus/Int/Bin: 1 var
-        //   - Minus: 1 surrogate (x' = -y)
-        //   - URS: 2 vars (x+ and x-)
-        // To keep it robust: return the first |model.NumVars| if no URS/Minus existed, else fall back to trimmed.
-        // In our demo video, just display canonical X and objective; sensitivity will use tableau anyway.
-        int take = Math.Min(model.NumVars, Math.Max(0, newVarCount));
-        return fullX.Take(take).ToArray();
-    }
-
-    private static string RenderTableau(double[,] T, int[] basic, int[] nonBasic, string title)
-    {
-        int rows = T.GetLength(0);
-        int cols = T.GetLength(1);
-        var sb = new System.Text.StringBuilder();
-        sb.AppendLine($"--- {title} ---");
-
-        sb.Append("Basic | ");
-        for (int j = 0; j < cols - 1; j++) sb.Append($"x{j + 1}\t");
-        sb.Append("RHS").AppendLine();
-
-        for (int i = 0; i < rows - 1; i++)
+        private static void Pivot(double[,] T, int prow, int pcol, int width)
         {
-            sb.Append($"x{basic[i] + 1}\t| ");
-            for (int j = 0; j < cols - 1; j++) sb.Append($"{T[i, j]:0.###}\t");
-            sb.Append($"{T[i, cols - 1]:0.###}").AppendLine();
+            double piv = T[prow, pcol];
+            if (Math.Abs(piv) < EPS) throw new InvalidOperationException("Pivot is ~0.");
+
+            ScaleRow(T, prow, 1.0 / piv, width);
+            int height = T.GetLength(0);
+            for (int r = 0; r < height; r++)
+            {
+                if (r == prow) continue;
+                double k = T[r, pcol];
+                if (Math.Abs(k) > EPS) AddScaledRow(T, r, prow, -k, width);
+            }
         }
 
-        sb.Append(" z   | ");
-        for (int j = 0; j < cols - 1; j++) sb.Append($"{T[rows - 1, j]:0.###}\t");
-        sb.Append($"{T[rows - 1, cols - 1]:0.###}").AppendLine();
+        private static double[] ExtractPrimal(double[,] T, int m, int n, int[] basis)
+        {
+            var x = new double[n];
+            for (int r = 0; r < m; r++)
+            {
+                int j = basis[r];
+                if (j >= 0 && j < n) x[j] = T[r + 1, n];
+            }
+            return x;
+        }
 
-        return sb.ToString();
+        private static string RenderTableau(string title, double[,] T, int m, int n, int[] basis)
+        {
+            var I = CultureInfo.InvariantCulture;
+            var sb = new StringBuilder();
+            sb.AppendLine(title);
+
+            // header
+            sb.Append("Basic |");
+            for (int j = 0; j < n; j++) sb.Append($" x{(j + 1).ToString(I),-3}\t");
+            sb.Append("RHS");
+            sb.AppendLine();
+
+            // z-row first
+            sb.Append(" z    |");
+            for (int j = 0; j < n; j++) sb.Append(T[0, j].ToString("0.###", I)).Append('\t');
+            sb.Append(T[0, n].ToString("0.###", I));
+            sb.AppendLine();
+            sb.AppendLine(new string('-', 60));
+
+            // constraints
+            for (int i = 0; i < m; i++)
+            {
+                string bcol = (i < basis.Length && basis[i] >= 0) ? $"x{basis[i] + 1}" : " ? ";
+                sb.Append($"{bcol,5} |");
+                for (int j = 0; j < n; j++) sb.Append(T[i + 1, j].ToString("0.###", I)).Append('\t');
+                sb.Append(T[i + 1, n].ToString("0.###", I));
+                sb.AppendLine();
+            }
+            return sb.ToString();
+        }
     }
 }
-
-
