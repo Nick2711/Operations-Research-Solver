@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
@@ -15,6 +15,8 @@ namespace Solver.Engine.Simplex
         private const int MAX_ITERS = 10000;
         private static readonly ITableauPrinter Printer = new DefaultTableauPrinter();
 
+        private sealed record IterRow(int Iter, string Enter, string Leave, double Theta, double Z);
+
         public SolverResult Solve(LpModel model)
         {
             var log = new List<string>();
@@ -25,12 +27,12 @@ namespace Solver.Engine.Simplex
 
             if (canRes.Log is { Count: > 0 })
             {
-                log.Add("� Canonicalization steps �");
+                log.Add("— Canonicalization steps —");
                 log.AddRange(canRes.Log);
                 log.Add("");
             }
 
-            // Phase I if required (tableau-based runner, silent)
+            // Phase I if required (tableau runner, silent)
             if (can.PhaseIRequired)
             {
                 var p1 = RunPhaseI(can, log);
@@ -39,7 +41,7 @@ namespace Solver.Engine.Simplex
                 can = p1.phaseII;
             }
 
-            // Print canonical form once (for parity with tableau path)
+            // Show canonical form once
             log.Add(Printer.RenderCanonical(
                 can.A, can.b, can.c,
                 model.NumVars,
@@ -58,8 +60,8 @@ namespace Solver.Engine.Simplex
             int n = can.A.GetLength(1);
             int p = model.NumVars;
 
-            // Basis array (columns of A that form B)
             var basis = (can.BasicIdx ?? Array.Empty<int>()).ToArray();
+            var summary = new List<IterRow>();
 
             int iter = 0;
             while (iter++ < MAX_ITERS)
@@ -75,37 +77,68 @@ namespace Solver.Engine.Simplex
                 var cB = basis.Select(j => can.c[j]).ToArray();
                 var yT = RowTimesMatrix(cB, Binv); // length m
 
-                // reduced costs r_j = c_j - y^T a_j
+                // reduced costs r_j = c_j - y^T a_j   (Max version)
                 var rc = new double[n];
                 int enter = -1;
-                double best = 0.0; // for Max, positive reduced cost is profitable
+                double best = 0.0;
                 for (int j = 0; j < n; j++)
                 {
-                    // skip basic cols
                     if (Array.IndexOf(basis, j) >= 0) { rc[j] = 0; continue; }
-
                     var a_j = GetColumn(can.A, j);
                     double rj = can.c[j] - Dot(yT, a_j);
                     rc[j] = rj;
                     if (rj > best + EPS) { best = rj; enter = j; }
                 }
 
+                // Current objective (Max-sense)
+                double zNow = Dot(cB, xB) + can.z0;
+
                 if (enter == -1)
                 {
-                    // Optimal
-                    double z = Dot(cB, xB) + can.z0;
+                    // Optimal — print sensitivity
+                    log.Add("Optimality reached (Revised).");
+
+                    // duals y (shadow prices), in row order
+                    var duals = yT.Select(v => v.ToString("0.###", CultureInfo.InvariantCulture)).ToArray();
+                    log.Add("Duals (shadow prices y for c1..cm): " + string.Join(", ", duals));
+
+                    // reduced costs for nonbasic
+                    var rcPairs = Enumerable.Range(0, n)
+                        .Where(j => Array.IndexOf(basis, j) < 0)
+                        .Select(j =>
+                        {
+                            string name = (can.Map.ColumnNames is { Length: > 0 } && j < can.Map.ColumnNames.Length)
+                                ? can.Map.ColumnNames[j]
+                                : (j < p ? $"x{j + 1}" : $"s{j - p + 1}");
+                            return $"{name}={rc[j].ToString("0.###", CultureInfo.InvariantCulture)}";
+                        });
+                    log.Add("Reduced costs (nonbasic): " + string.Join(", ", rcPairs));
+
+                    // also show the compact iteration summary
+                    if (summary.Count > 0)
+                    {
+                        log.Add("");
+                        log.Add("— Iteration summary (Revised) —");
+                        log.Add("iter\tenter\tleave\tθ\tz");
+                        foreach (var r in summary)
+                        {
+                            log.Add($"{r.Iter}\t{r.Enter}\t{r.Leave}\t{r.Theta.ToString("0.###", CultureInfo.InvariantCulture)}\t{r.Z.ToString("0.###", CultureInfo.InvariantCulture)}");
+                        }
+                    }
+
+                    // build full primal
                     var xFull = new double[n];
                     for (int i = 0; i < m; i++) xFull[basis[i]] = xB[i];
                     var xDecision = xFull.Take(Math.Min(model.NumVars, xFull.Length)).ToArray();
-                    log.Add("Optimality reached (Revised).");
-                    return new SolverResult(true, z, xDecision, log);
+
+                    return new SolverResult(true, zNow, xDecision, log);
                 }
 
                 // direction d = B^{-1} a_enter
                 var aEnter = GetColumn(can.A, enter);
                 var d = MatVec(Binv, aEnter);
 
-                // ratio test: theta = min_i { xB_i / d_i | d_i > 0 }
+                // ratio test
                 int leave = -1;
                 double theta = double.PositiveInfinity;
                 for (int i = 0; i < m; i++)
@@ -129,10 +162,14 @@ namespace Solver.Engine.Simplex
                 }
 
                 log.Add($"--- Iteration {iter} (Revised): enter {NiceColName(enter, can.Map.ColumnNames, p)}, leave {NiceRowName(leave, can.Map.RowNames)} ---");
+                summary.Add(new IterRow(
+                    iter,
+                    NiceColName(enter, can.Map.ColumnNames, p),
+                    NiceRowName(leave, can.Map.RowNames),
+                    theta, zNow));
 
-                // Update basis: replace basis[leave] with 'enter'
+                // Update basis
                 basis[leave] = enter;
-                // (We rebuild B/Binv next loop; no eta updates here � simple & robust for class sizes)
             }
 
             log.Add("Max iterations exceeded (Revised).");
@@ -194,7 +231,7 @@ namespace Solver.Engine.Simplex
             return r;
         }
 
-        // Gauss�Jordan inverse (OK for small classroom problems)
+        // Gauss–Jordan inverse (OK for small classroom problems)
         private static double[,] Invert(double[,] A)
         {
             int n = A.GetLength(0);
@@ -206,7 +243,6 @@ namespace Solver.Engine.Simplex
 
             for (int col = 0; col < n; col++)
             {
-                // pivot (partial)
                 int piv = col;
                 double best = Math.Abs(M[col, col]);
                 for (int r = col + 1; r < n; r++)
@@ -222,11 +258,9 @@ namespace Solver.Engine.Simplex
                     SwapRows(I, col, piv);
                 }
 
-                // scale pivot row
                 double p = M[col, col];
                 for (int j = 0; j < n; j++) { M[col, j] /= p; I[col, j] /= p; }
 
-                // eliminate other rows
                 for (int r = 0; r < n; r++)
                 {
                     if (r == col) continue;
@@ -287,14 +321,12 @@ namespace Solver.Engine.Simplex
                 return (false, new CanonicalForm());
             }
 
-            // z := z + sum(cb * row_b)
             for (int r = 0; r < m; r++)
             {
                 double cb = can.cPhaseI[basis[r]];
                 if (Math.Abs(cb) > EPS) AddScaledRow(T, 0, r + 1, cb, width);
             }
 
-            // simplex loop (enter most negative z-row)
             int iter = 0;
             while (iter++ < MAX_ITERS)
             {
@@ -323,10 +355,8 @@ namespace Solver.Engine.Simplex
                 basis[leave] = enter;
             }
 
-            // z_I
             if (T[0, n] < -EPS) { log.Add("Phase I: infeasible (z_I < 0)."); return (false, new CanonicalForm()); }
 
-            // pivot artificials out if still basic
             var art = new HashSet<int>(can.ArtificialIdx ?? Array.Empty<int>());
             for (int r = 0; r < m; r++)
             {
@@ -342,7 +372,6 @@ namespace Solver.Engine.Simplex
                 basis[r] = pcol;
             }
 
-            // remove artificials
             var keep = Enumerable.Range(0, n).Where(j => !art.Contains(j)).ToArray();
             int n2 = keep.Length;
             var A2 = new double[m, n2];
@@ -363,7 +392,6 @@ namespace Solver.Engine.Simplex
 
             var nonBasic2 = Enumerable.Range(0, n2).Except(basis2).ToArray();
 
-            // names remap
             var colNames2 = (can.Map.ColumnNames is { Length: > 0 })
                 ? keep.Select(j => can.Map.ColumnNames[j]).ToArray()
                 : Enumerable.Range(1, n2).Select(j => j <= can.NumVarsOriginal ? $"x{j}" : $"s{j - can.NumVarsOriginal}").ToArray();
@@ -415,9 +443,7 @@ namespace Solver.Engine.Simplex
         {
             double piv = T[prow, pcol];
             if (Math.Abs(piv) < EPS) throw new InvalidOperationException("Pivot ~ 0.");
-            // scale pivot row
             for (int j = 0; j < width; j++) T[prow, j] /= piv;
-            // eliminate
             int H = T.GetLength(0);
             for (int r = 0; r < H; r++)
             {

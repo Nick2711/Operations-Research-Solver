@@ -8,6 +8,7 @@ using Shared.Models;
 using Solver.Engine.IO;
 using Solver.Engine.Simplex;
 using Solver.Engine.Core;
+using Solver.Engine.Integer;
 
 namespace Server.Controllers
 {
@@ -54,6 +55,7 @@ namespace Server.Controllers
                 {
                     Algorithm.PrimalSimplex => new PrimalSimplexSolver(),
                     Algorithm.RevisedSimplex => new RevisedSimplexSolver(),
+                    Algorithm.BranchAndBound => new BranchAndBoundSimplexSolver(),
                     _ => new PrimalSimplexSolver()
                 };
 

@@ -3,7 +3,8 @@
 public enum Algorithm
 {
     PrimalSimplex,
-    RevisedSimplex,
+    RevisedSimplex = 1,
+    BranchAndBound = 2,
     // add more later...
 }
 

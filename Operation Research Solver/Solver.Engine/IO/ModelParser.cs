@@ -20,6 +20,8 @@ namespace Solver.Engine.IO
     /// - Comma decimals accepted (auto-converted to '.').
     /// - Comments starting with '#' or '//' are stripped.
     /// - Relation and RHS may be split ("<= 48") or glued ("<=48").
+    /// - Sign restrictions are CASE-INSENSITIVE: "+", "PLUS", "i", "INT", "b", "BIN", "URS", "free", etc.
+    /// - Sign line allows commas/semicolons as delimiters.
     /// </summary>
     public static class ModelParser
     {
@@ -109,13 +111,21 @@ namespace Solver.Engine.IO
             model.Constraints.AddRange(constraints);
 
             // ---- Sign restrictions (last line) ----
+            // Accept case-insensitive tokens, allow commas/semicolons; if only one token, repeat for all vars.
             var signsLine = lines[^1].Trim();
-            var signToks = signsLine.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-            if (signToks.Length != model.NumVars)
-                throw new InvalidOperationException("Last line must contain exactly one sign token per variable.");
+
+            var signToks = SplitTokens(signsLine).ToList(); // tolerant split
+            if (signToks.Count == 0)
+                throw new InvalidOperationException("Last line must contain sign restrictions (e.g., '+ +' or 'i i').");
+
+            if (signToks.Count == 1 && model.NumVars > 1)
+                signToks = Enumerable.Repeat(signToks[0], model.NumVars).ToList();
+
+            if (signToks.Count != model.NumVars)
+                throw new InvalidOperationException($"Last line must contain exactly one sign token per variable (expected {model.NumVars}, got {signToks.Count}).");
 
             for (int i = 0; i < model.NumVars; i++)
-                model.Variables[i].Sign = ParseSignRestriction(signToks[i]);
+                model.Variables[i].Sign = ParseSignToken(signToks[i]);
 
             return new ParseResult(model);
         }
@@ -202,14 +212,26 @@ namespace Solver.Engine.IO
             throw new InvalidOperationException($"Invalid number token: {s}");
         }
 
-        private static SignRestriction ParseSignRestriction(string s) => s.ToLowerInvariant() switch
+        private static IEnumerable<string> SplitTokens(string s)
+            => Regex.Split(s, @"[\s,;]+")
+                    .Where(t => !string.IsNullOrWhiteSpace(t));
+
+        private static SignRestriction ParseSignToken(string tok)
         {
-            "+" => SignRestriction.Plus,
-            "-" => SignRestriction.Minus,
-            "urs" => SignRestriction.Urs,
-            "int" => SignRestriction.Int,
-            "bin" => SignRestriction.Bin,
-            _ => throw new InvalidOperationException($"Invalid sign restriction: {s}")
-        };
+            if (string.IsNullOrWhiteSpace(tok))
+                throw new InvalidOperationException("Empty sign token.");
+
+            var k = tok.Trim().ToLowerInvariant();
+
+            return k switch
+            {
+                "+" or "plus" or "nonneg" or "non-negative" => SignRestriction.Plus,
+                "-" or "minus" => SignRestriction.Minus,
+                "urs" or "free" or "unrestricted" => SignRestriction.Urs,
+                "i" or "int" or "integer" => SignRestriction.Int,
+                "b" or "bin" or "binary" => SignRestriction.Bin,
+                _ => throw new InvalidOperationException($"Invalid sign restriction: {tok}")
+            };
+        }
     }
 }
