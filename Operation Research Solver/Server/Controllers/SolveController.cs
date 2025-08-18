@@ -1,11 +1,13 @@
 ﻿using System.Diagnostics;
+using System.Globalization;
+using System.Linq;
 using System.Text;
-using System.Text.RegularExpressions;           // << add this
 using Microsoft.AspNetCore.Mvc;
 using Shared.Models;
 
 using Solver.Engine.IO;
 using Solver.Engine.Simplex;
+using Solver.Engine.Core;
 
 namespace Server.Controllers
 {
@@ -30,39 +32,13 @@ namespace Server.Controllers
                 cts.CancelAfter(TimeSpan.FromSeconds(req.Settings.TimeLimitSeconds));
             var token = cts.Token;
 
-            // ----------- sanitize/normalize input lines -----------
-            // 1) unify newlines
-            var rawLines = (req.ModelText ?? string.Empty)
-                .Replace("\r\n", "\n")
-                .Split('\n');
-
-            // 2) strip comments and squeeze whitespace
-            static string Clean(string s) => Regex.Replace(s, @"\s+", " ").Trim();
-
-            var cleaned = rawLines
-                .Select(l => l.Split('#')[0])                                  // strip comments after '#'
-                .Select(Clean)                                                 // collapse whitespace
-                .Where(l => l.Length > 0)                                      // drop empties
-                .Select(l => Regex.Replace(l, @"\s*(<=|>=|=)\s*", " $1 "))     // ensure spaces around <=, >=, =
-                .ToArray();
-
-            if (cleaned.Length < 2)
-            {
-                sw.Stop();
-                return BadRequest(new SolveResponse
-                {
-                    OutputText = "Error: Not enough lines after cleaning.",
-                    RuntimeMs = sw.ElapsedMilliseconds
-                });
-            }
-            // ------------------------------------------------------
-
             try
             {
-                // Parse text -> model (use cleaned)
-                var parsed = ModelParser.Parse(cleaned);
+                // Parse text -> model (parser owns normalization/cleaning)
+                var raw = req.ModelText ?? string.Empty;
+                var model = ModelParser.Parse(raw);
 
-                if (parsed == null || parsed.Model == null)
+                if (model == null)
                 {
                     sw.Stop();
                     return Ok(new SolveResponse
@@ -77,13 +53,13 @@ namespace Server.Controllers
                 ISolver solver = req.Algorithm switch
                 {
                     Algorithm.PrimalSimplex => new PrimalSimplexSolver(),
-                    Algorithm.RevisedSimplex => new RevisedSimplexSolverStub(),   // replace when implemented
+                    Algorithm.RevisedSimplex => new RevisedSimplexSolver(),
                     _ => new PrimalSimplexSolver()
                 };
 
                 token.ThrowIfCancellationRequested();
 
-                var result = solver.Solve(parsed.Model);
+                var result = solver.Solve(model);
 
                 token.ThrowIfCancellationRequested();
 
@@ -100,12 +76,24 @@ namespace Server.Controllers
                         outText.AppendLine(l);
                 }
 
+                // Convert objective back to the user's original sense (we solve Max internally)
+                double userObjective = result.Success
+                    ? (model.Direction == OptimizeDirection.Max
+                        ? result.ObjectiveValue
+                        : -result.ObjectiveValue)
+                    : 0.0;
+
                 outText.AppendLine();
                 if (result.Success)
                 {
-                    outText.AppendLine($"SUCCESS — Objective: {result.ObjectiveValue:0.###}");
+                    outText.AppendLine($"SUCCESS — Objective: {userObjective.ToString("0.###", CultureInfo.InvariantCulture)}");
+
                     if (result.X is { Length: > 0 })
-                        outText.AppendLine("Solution: " + string.Join(", ", result.X.Select((v, i) => $"x{i + 1}={v:0.###}")));
+                    {
+                        var sol = string.Join(", ",
+                            result.X.Select((v, i) => $"x{i + 1}={v.ToString("0.###", CultureInfo.InvariantCulture)}"));
+                        outText.AppendLine("Solution: " + sol);
+                    }
                 }
                 else
                 {
@@ -121,9 +109,9 @@ namespace Server.Controllers
                     Success = result.Success,
                     Unbounded = result.Unbounded,
                     Infeasible = result.Infeasible,
-                    Objective = result.Success ? Math.Round(result.ObjectiveValue, 3) : (double?)null,
+                    Objective = result.Success ? Math.Round(userObjective, 3) : (double?)null,
                     SolutionSummary = result.Success && result.X is { Length: > 0 }
-                        ? string.Join(", ", result.X.Select((v, i) => $"x{i + 1}={v:0.###}"))
+                        ? string.Join(", ", result.X.Select((v, i) => $"x{i + 1}={v.ToString("0.###", CultureInfo.InvariantCulture)}"))
                         : null,
                     OutputText = outText.ToString(),
                     RuntimeMs = sw.ElapsedMilliseconds
@@ -137,11 +125,9 @@ namespace Server.Controllers
             catch (Exception ex)
             {
                 sw.Stop();
-                // include cleaned lines to help debug formatting issues
-                var dbg = string.Join("\n", cleaned.Select((l, i) => $"{i}: {l}"));
                 return BadRequest(new SolveResponse
                 {
-                    OutputText = $"Error: {ex.Message}\n\n[Cleaned lines]\n{dbg}",
+                    OutputText = $"Error: {ex.Message}",
                     RuntimeMs = sw.ElapsedMilliseconds
                 });
             }
