@@ -7,13 +7,6 @@ using Solver.Engine.Simplex;
 
 namespace Solver.Engine.Integer
 {
-    /// <summary>
-    /// Branch & Bound using PrimalSimplexSolver at every node so we log full tableaus.
-    /// - Adds explicit bound rows: x_j ≤ floor, x_j ≥ ceil
-    /// - Logs per-node headers + primal logs + prune reasons
-    /// - Collects a candidate list and the best incumbent (with correct sign)
-    /// - Emits per-branch "best side" outcome (≤ floor vs ≥ ceil)
-    /// </summary>
     public sealed class BranchAndBoundSimplexSolver : ISolver
     {
         public string Name => "Branch & Bound (Tableau)";
@@ -23,6 +16,7 @@ namespace Solver.Engine.Integer
 
         private readonly PrimalSimplexSolver _primal = new();
 
+        // NodeState: Holds information for each node during the Branch & Bound search
         private sealed class NodeState
         {
             public int Id { get; }
@@ -31,9 +25,15 @@ namespace Solver.Engine.Integer
             public List<(int j, double? lb, double? ub)> Bounds { get; }
 
             public NodeState(int id, int depth, string path, List<(int j, double? lb, double? ub)> bounds)
-            { Id = id; Depth = depth; Path = path; Bounds = bounds; }
+            {
+                Id = id;
+                Depth = depth;
+                Path = path;
+                Bounds = bounds;
+            }
         }
 
+        // Candidate: Holds information about a candidate solution
         private sealed class Candidate
         {
             public int NodeId { get; }
@@ -44,10 +44,17 @@ namespace Solver.Engine.Integer
             public bool IsIntegral { get; }
 
             public Candidate(int nodeId, int depth, string path, double objective, double[] x, bool isIntegral)
-            { NodeId = nodeId; Depth = depth; Path = path; Objective = objective; X = x; IsIntegral = isIntegral; }
+            {
+                NodeId = nodeId;
+                Depth = depth;
+                Path = path;
+                Objective = objective;
+                X = x;
+                IsIntegral = isIntegral;
+            }
         }
 
-        // For "best side" summaries after each split
+        // BranchOutcome: Used to track the branch outcome for each node
         private sealed class BranchOutcome
         {
             public int ParentId;
@@ -118,7 +125,15 @@ namespace Solver.Engine.Integer
 
                 log.Add($"\n== Best Integer Solution ==\nObjective: {F(incumbentZ)}");
                 log.Add($"Backtrace: {incumbentPath}");
-                log.Add(RenderSolutionVector(model, incumbentX));
+
+                // Display decision variables for the best candidate
+                log.Add("\n== Decision Variables (Best Candidate) ==");
+                for (int i = 0; i < incumbentX.Length; i++)
+                {
+                    var varName = model.Variables[i].Name ?? $"x{i + 1}";
+                    log.Add($"{varName} = {F(incumbentX[i])}");
+                }
+
                 return new SolverResult(true, incumbentZ, incumbentX, log);
             }
 
@@ -290,13 +305,19 @@ namespace Solver.Engine.Integer
 
             log.Add($"\n== Best Integer Solution ==\nObjective: {F(incumbentZ)}");
             log.Add($"Backtrace: {incumbentPath}");
-            log.Add(RenderSolutionVector(model, incumbentX));
+
+            // Display decision variables for the best candidate
+            log.Add("\n== Decision Variables (Best Candidate) ==");
+            for (int i = 0; i < incumbentX.Length; i++)
+            {
+                var varName = model.Variables[i].Name ?? $"x{i + 1}";
+                log.Add($"{varName} = {F(incumbentX[i])}");
+            }
 
             return new SolverResult(true, incumbentZ, incumbentX, log);
         }
 
         // ----------------------- helpers -----------------------
-
         private static IEnumerable<int> DetectIntegerIndices(LpModel model)
         {
             for (int j = 0; j < model.NumVars; j++)
