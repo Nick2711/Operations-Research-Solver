@@ -4,9 +4,14 @@ using System.Globalization;
 using System.Linq;
 using Solver.Engine.Core;
 using Solver.Engine.Simplex;
+using Solver.Engine.IO;
 
 namespace Solver.Engine.Integer
 {
+    /// <summary>
+    /// Branch & Bound (Tableau) with c8−c9 injection and Dual Simplex re-optimization at each node.
+    /// Primal / Revised / Dual solvers are untouched; Dual is only used for the initial root solve (via tableau too).
+    /// </summary>
     public sealed class BranchAndBoundSimplexSolver : ISolver
     {
         public string Name => "Branch & Bound (Tableau)";
@@ -14,421 +19,704 @@ namespace Solver.Engine.Integer
         private const double EPS = 1e-9;
         private const double INT_TOL = 1e-6;
 
-        // 🔁 Use Dual Simplex for every LP relaxation (root + all nodes)
-        private readonly DualSimplexSolver _dual = new();
-
-        // NodeState: Holds information for each node during the Branch & Bound search
+        // -----------------------------
+        // Node bookkeeping
+        // -----------------------------
         private sealed class NodeState
         {
             public int Id { get; }
+            public int? ParentId { get; }
             public int Depth { get; }
             public string Path { get; }
             public List<(int j, double? lb, double? ub)> Bounds { get; }
 
-            public NodeState(int id, int depth, string path, List<(int j, double? lb, double? ub)> bounds)
+            public NodeState(int id, int? parentId, int depth, string path, List<(int j, double? lb, double? ub)> bounds)
             {
                 Id = id;
+                ParentId = parentId;
                 Depth = depth;
                 Path = path;
                 Bounds = bounds;
             }
         }
 
-        // Candidate: Holds information about a candidate solution
-        private sealed class Candidate
+        // -----------------------------
+        // Compact tableau state we carry across nodes
+        // -----------------------------
+        private sealed class TableauState
         {
-            public int NodeId { get; }
-            public int Depth { get; }
-            public string Path { get; }
-            public double Objective { get; }   // user objective (correct sign)
-            public double[] X { get; }
-            public bool IsIntegral { get; }
-
-            public Candidate(int nodeId, int depth, string path, double objective, double[] x, bool isIntegral)
-            {
-                NodeId = nodeId;
-                Depth = depth;
-                Path = path;
-                Objective = objective;
-                X = x;
-                IsIntegral = isIntegral;
-            }
+            public CanonicalForm Can = new();      // Phase II mapping
+            public double[,] T = new double[0, 0]; // (m+1) x (n+1) tableau (z row at index 0, RHS last col)
+            public int[] Basis = Array.Empty<int>();
+            public int M;                          // constraints
+            public int N;                          // columns (no RHS)
+            public int P;                          // # original decision vars
+            public string[] ColNames = Array.Empty<string>();
+            public string[] RowNames = Array.Empty<string>();
         }
 
-        // BranchOutcome: Used to track the branch outcome for each node
-        private sealed class BranchOutcome
-        {
-            public int ParentId;
-            public string ParentPath = "";
-            public string VarName = "";
-            public double Xval, Floor, Ceil;
-            public int LeftId, RightId;          // left: ≤ floor, right: ≥ ceil
-            public double? LeftZ, RightZ;        // user objective
-            public string LeftStatus = "", RightStatus = ""; // infeasible / fractional / integral
-        }
-
+        // -----------------------------
+        // PUBLIC ENTRY
+        // -----------------------------
         public SolverResult Solve(LpModel model)
         {
             var log = new List<string>();
             log.Add("== Branch & Bound (Tableau) ==");
             log.Add($"Direction: {model.Direction} | Vars: {model.NumVars} | Cons: {model.NumConstraints}");
-            log.Add("LP relaxations solved with: Dual Simplex");
+            log.Add("LP relaxations re-optimized with: Dual Simplex");
+            log.Add("Branching uses c8−c9 injection (z-row untouched), then Dual pivots.");
 
-            var intIdx = DetectIntegerIndices(model).ToArray();
-            if (intIdx.Length == 0)
+            // Build a reusable Phase II tableau for the root (so we can inject bounds fast).
+            var rootState = PhaseIThenPhaseII(model, log);
+
+            // Solve root relaxation (from tableau)
+            var rootDual = DualOptimizeFromHere(rootState);
+            if (!rootDual.success && rootDual.infeasible)
             {
-                log.Add("No integer/binary variables detected. Solving as pure LP (Dual Simplex).");
-                var pure = _dual.Solve(model);
-                pure.Log.Insert(0, "== Root LP (no integer vars) ==");
-                MergeInto(log, pure.Log);
-                // Return INTERNAL objective (consistent with other solvers)
-                return new SolverResult(pure.Success, pure.ObjectiveValue, pure.X, log, pure.Unbounded, pure.Infeasible);
-            }
-
-            log.Add($"Integer variable indices (1-based): {string.Join(", ", intIdx.Select(i => (i + 1).ToString()))}");
-
-            // Root relaxation
-            log.Add("\n== Root LP Relaxation (Dual) ==");
-            var rootLP = _dual.Solve(model);
-            PrefixInto(log, rootLP.Log, "- ");
-
-            if (rootLP.Infeasible)
-            {
-                log.Add("Root LP infeasible. No solution.");
+                log.Add("Root LP is infeasible → problem infeasible.");
                 return new SolverResult(false, 0, Array.Empty<double>(), log, infeasible: true);
             }
-            if (rootLP.Unbounded)
+            if (!rootDual.success && rootDual.unbounded)
             {
-                log.Add("Root LP unbounded. Cannot proceed with B&B.");
+                log.Add("Root LP is unbounded → MILP is unbounded or infeasible.");
                 return new SolverResult(false, 0, Array.Empty<double>(), log, unbounded: true);
             }
 
-            // Incumbent (best integer so far), stored as USER objective
-            var hasIncumbent = false;
-            double incumbentZ = double.NaN;
-            double[] incumbentX = Array.Empty<double>();
-            string incumbentPath = "";
+            double rootZ = rootDual.z;
+            double[] rootX = rootDual.xDecision;
 
-            var candidates = new List<Candidate>();
+            // Integrality set
+            var intIdx0 = ExtractIntegerIndices(model);
+            var intIdx = intIdx0.Length == 0
+                ? Enumerable.Range(0, Math.Min(model.NumVars, rootX.Length)).ToArray()
+                : intIdx0;
 
-            // If the LP relaxation already satisfies integrality
-            if (IsIntegral(rootLP.X, intIdx))
+            // If root already integral, done.
+            if (IsIntegral(rootX, intIdx))
             {
-                var rootZ = UserObjective(model.Direction, rootLP.ObjectiveValue);
-                hasIncumbent = true;
-                incumbentZ = rootZ;
-                incumbentX = RoundToIntegers(rootLP.X, intIdx);
-                incumbentPath = "root";
-                candidates.Add(new Candidate(0, 0, "root", rootZ, rootLP.X, true));
-
-                log.Add($"\nIntegral at root → Objective {F(rootZ)}");
-                log.Add("\n== Candidates Summary ==");
-                foreach (var line in RenderCandidates(candidates, hasIncumbent, incumbentZ, incumbentPath))
-                    log.Add(line);
-
-                log.Add($"\n== Best Integer Solution ==\nObjective: {F(incumbentZ)}");
-                log.Add($"Backtrace: {incumbentPath}");
-
-                // Display decision variables for the best candidate
-                log.Add("\n== Decision Variables (Best Candidate) ==");
-                for (int i = 0; i < incumbentX.Length; i++)
-                {
-                    var varName = model.Variables[i].Name ?? $"x{i + 1}";
-                    log.Add($"{varName} = {F(incumbentX[i])}");
-                }
-
-                // Return INTERNAL objective
-                return new SolverResult(true, InternalObjective(model.Direction, incumbentZ), incumbentX, log);
+                log.Add("Root LP solution is already integer → DONE.");
+                return new SolverResult(true, rootZ, rootX, log);
             }
 
-            // DFS stack
-            int nextId = 1;
-            var stack = new Stack<NodeState>();
-            stack.Push(new NodeState(0, 0, "root", new List<(int j, double? lb, double? ub)>()));
+            // Incumbent
+            double incumbentValue = IsMaximization(model.Direction)
+                ? double.NegativeInfinity : double.PositiveInfinity;
+            double[] incumbentX = Array.Empty<double>();
+            bool haveIncumbent = false;
 
-            // For "branch outcome" summaries
-            var branchByParent = new Dictionary<int, BranchOutcome>();
-            var parentOf = new Dictionary<int, int>(); // childId -> parentId
+            // DFS
+            var stack = new Stack<NodeState>();
+            int nextId = 1;
+            var rootNode = new NodeState(id: 0, parentId: null, depth: 0, path: "root",
+                                         bounds: new List<(int j, double? lb, double? ub)>());
+            stack.Push(rootNode);
+
+            // Store solved tableau at each node so children can inject further
+            var nodeTableaux = new Dictionary<int, TableauState>();
+            var rootSolved = CloneTableau(rootState); // already dual-optimal
+            nodeTableaux[rootNode.Id] = rootSolved;
+
+            bool WorseThanIncumbent(double nodeBound)
+            {
+                if (!haveIncumbent) return false;
+                return IsMaximization(model.Direction)
+                    ? nodeBound <= incumbentValue - 1e-12
+                    : nodeBound >= incumbentValue + 1e-12;
+            }
 
             while (stack.Count > 0)
             {
                 var node = stack.Pop();
 
-                // Build a child LP with all branch rows (bounds)
-                var childModel = CloneModel(model);
+                // Base tableau = parent's solved tableau
+                TableauState parentState = node.ParentId == null
+                    ? nodeTableaux[0]
+                    : nodeTableaux[node.ParentId.Value];
+
+                var work = CloneTableau(parentState);
+
+                // Inject each accumulated bound with c8−c9 (one new row/col per bound), then dual re-opt
                 foreach (var (j, lb, ub) in node.Bounds)
                 {
-                    if (lb.HasValue) AddBoundRow(childModel, j, Relation.GreaterOrEqual, lb.Value); // x_j ≥ lb
-                    if (ub.HasValue) AddBoundRow(childModel, j, Relation.LessOrEqual, ub.Value); // x_j ≤ ub
+                    if (lb.HasValue) InjectBranchRow(work, j, isUpper: false, bound: Math.Ceiling(lb.Value - 1e-12));
+                    if (ub.HasValue) InjectBranchRow(work, j, isUpper: true, bound: Math.Floor(ub.Value + 1e-12));
                 }
 
-                log.Add($"\n== Node {node.Id} (depth {node.Depth}) :: {node.Path} ==");
-                if (node.Bounds.Count > 0)
+                var re = DualOptimizeFromHere(work);
+                if (!re.success && re.infeasible)
                 {
-                    var added = node.Bounds.Select(b =>
-                    {
-                        var nm = childModel.Variables[b.j].Name ?? $"x{b.j + 1}";
-                        if (b.lb.HasValue && b.ub.HasValue) return $"{nm} ∈ [{F(b.lb.Value)},{F(b.ub.Value)}]";
-                        if (b.lb.HasValue) return $"{nm} ≥ {F(b.lb.Value)}";
-                        if (b.ub.HasValue) return $"{nm} ≤ {F(b.ub.Value)}";
-                        return "";
-                    });
-                    log.Add("Added bound rows: " + string.Join(", ", added));
+                    log.Add($"Prune node {node.Path}: infeasible after injection.");
+                    continue;
                 }
-
-                // 🔁 Solve LP relaxation at node with Dual Simplex
-                var res = _dual.Solve(childModel);
-                PrefixInto(log, res.Log, "- ");
-
-                if (res.Infeasible) { log.Add("→ Pruned (infeasible)."); continue; }
-                if (res.Unbounded) { log.Add("→ Pruned (unbounded relaxation)."); continue; }
-
-                // Convert to user objective before logging/pruning
-                var nodeZ = UserObjective(childModel.Direction, res.ObjectiveValue);
-                bool integralHere = IsIntegral(res.X, intIdx);
-
-                candidates.Add(new Candidate(node.Id, node.Depth, node.Path, nodeZ, res.X, integralHere));
-
-                // If this node is part of a branch pair, store its outcome and print summary when both sides are known.
-                if (parentOf.TryGetValue(node.Id, out var pId) && branchByParent.TryGetValue(pId, out var br))
+                if (!re.success && re.unbounded)
                 {
-                    string status = res.Infeasible ? "infeasible" : (integralHere ? "integral" : "fractional");
-                    if (node.Id == br.LeftId) { br.LeftZ = nodeZ; br.LeftStatus = status; }
-                    if (node.Id == br.RightId) { br.RightZ = nodeZ; br.RightStatus = status; }
-
-                    if (br.LeftStatus != "" && br.RightStatus != "")
-                    {
-                        log.Add($"\n-- Branch outcome @ Node {pId} ({br.ParentPath}) on {br.VarName} = {F(br.Xval)} --");
-                        log.Add($"   Left  ({br.VarName} ≤ {F(br.Floor)}): {br.LeftStatus}" + (br.LeftZ.HasValue ? $"  z={F(br.LeftZ.Value)}" : ""));
-                        log.Add($"   Right ({br.VarName} ≥ {F(br.Ceil)}):  {br.RightStatus}" + (br.RightZ.HasValue ? $"  z={F(br.RightZ.Value)}" : ""));
-
-                        string bestSide = "?";
-                        if (childModel.Direction == OptimizeDirection.Min)
-                        {
-                            if (br.LeftZ.HasValue && br.RightZ.HasValue)
-                                bestSide = br.LeftZ.Value <= br.RightZ.Value ? "Left" : "Right";
-                            else if (br.LeftZ.HasValue) bestSide = "Left";
-                            else if (br.RightZ.HasValue) bestSide = "Right";
-                        }
-                        else
-                        {
-                            if (br.LeftZ.HasValue && br.RightZ.HasValue)
-                                bestSide = br.LeftZ.Value >= br.RightZ.Value ? "Left" : "Right";
-                            else if (br.LeftZ.HasValue) bestSide = "Left";
-                            else if (br.RightZ.HasValue) bestSide = "Right";
-                        }
-                        log.Add($"   ⇒ Best side ({childModel.Direction}): {bestSide}");
-                    }
-                }
-
-                // Prune by incumbent bound using USER objective
-                if (hasIncumbent)
-                {
-                    if (childModel.Direction == OptimizeDirection.Max && nodeZ <= incumbentZ + EPS)
-                    { log.Add($"→ Pruned by bound (max): node z={F(nodeZ)} ≤ incumbent {F(incumbentZ)}."); continue; }
-
-                    if (childModel.Direction == OptimizeDirection.Min && nodeZ >= incumbentZ - EPS)
-                    { log.Add($"→ Pruned by bound (min): node z={F(nodeZ)} ≥ incumbent {F(incumbentZ)}."); continue; }
-                }
-
-                if (integralHere)
-                {
-                    var xi = RoundToIntegers(res.X, intIdx);
-
-                    bool improves =
-                        !hasIncumbent ||
-                        (childModel.Direction == OptimizeDirection.Max && nodeZ > incumbentZ + EPS) ||
-                        (childModel.Direction == OptimizeDirection.Min && nodeZ < incumbentZ - EPS);
-
-                    if (improves)
-                    {
-                        hasIncumbent = true;
-                        incumbentZ = nodeZ;              // store user objective
-                        incumbentX = xi;
-                        incumbentPath = node.Path;
-                        log.Add($"→ New incumbent at node {node.Id}: z = {F(incumbentZ)} | path: {incumbentPath}");
-                    }
-                    else
-                    {
-                        log.Add("→ Integral but not improving incumbent.");
-                    }
-                    continue; // do not branch further from integral
-                }
-
-                // Choose fractional var
-                int jBranch = ChooseBranchVar(res.X, intIdx);
-                if (jBranch < 0)
-                {
-                    log.Add("→ No fractional var found unexpectedly. Skipping branch.");
+                    log.Add($"Node {node.Path}: unbounded relaxation (rare with finite bounds) → prune.");
                     continue;
                 }
 
-                double xj = res.X[jBranch];
-                double flo = Math.Floor(xj + 1e-12);
-                double cei = Math.Ceiling(xj - 1e-12);
-                var varName = childModel.Variables[jBranch].Name ?? $"x{jBranch + 1}";
+                var z = re.z;
+                var x = re.xDecision;
 
-                log.Add($"Branching on {varName} = {F(xj)} → ≤ {F(flo)} OR ≥ {F(cei)}");
-
-                // Right (≥ ceil) pushed first so Left is explored first (DFS)
-                var rightBounds = CopyBounds(node.Bounds);
-                rightBounds.Add((jBranch, lb: cei, ub: (double?)null));
-                int rightId = nextId++;
-                stack.Push(new NodeState(rightId, node.Depth + 1, node.Path + $" → {varName} ≥ {F(cei)}", rightBounds));
-
-                var leftBounds = CopyBounds(node.Bounds);
-                leftBounds.Add((jBranch, lb: (double?)null, ub: flo));
-                int leftId = nextId++;
-                stack.Push(new NodeState(leftId, node.Depth + 1, node.Path + $" → {varName} ≤ {F(flo)}", leftBounds));
-
-                // Track the pair for the "branch outcome" summary later
-                branchByParent[node.Id] = new BranchOutcome
+                // Bounding prune
+                if (WorseThanIncumbent(z))
                 {
-                    ParentId = node.Id,
-                    ParentPath = node.Path,
-                    VarName = varName,
-                    Xval = xj,
-                    Floor = flo,
-                    Ceil = cei,
-                    LeftId = leftId,
-                    RightId = rightId
-                };
-                parentOf[leftId] = node.Id;
-                parentOf[rightId] = node.Id;
+                    log.Add($"Prune node {node.Path}: bound {Fmt(z)} cannot beat incumbent {Fmt(incumbentValue)}.");
+                    continue;
+                }
+
+                // Integer? update incumbent
+                if (IsIntegral(x, intIdx))
+                {
+                    if (!haveIncumbent || Better(model.Direction, z, incumbentValue))
+                    {
+                        haveIncumbent = true;
+                        incumbentValue = z;
+                        incumbentX = x;
+                        log.Add($"New incumbent at node {node.Path}: z = {Fmt(z)}.");
+                    }
+                    continue;
+                }
+
+                // Branch
+                int jStar = ChooseFractional(x, intIdx, out double v);
+                double floorV = Math.Floor(v);
+                double ceilV = Math.Ceiling(v);
+
+                // Left: x_j ≤ ⌊v⌋, Right: x_j ≥ ⌈v⌉
+                var left = new List<(int j, double? lb, double? ub)>(node.Bounds) { (jStar, null, floorV) };
+                var right = new List<(int j, double? lb, double? ub)>(node.Bounds) { (jStar, ceilV, null) };
+
+                var leftNode = new NodeState(nextId++, node.Id, node.Depth + 1, node.Path + ".L", left);
+                var rightNode = new NodeState(nextId++, node.Id, node.Depth + 1, node.Path + ".R", right);
+
+                // Save this node's solved tableau for children to branch from
+                nodeTableaux[node.Id] = work;
+
+                // DFS order: explore left first
+                stack.Push(rightNode);
+                stack.Push(leftNode);
             }
 
-            // Wrap up
-            log.Add("\n== Candidates Summary ==");
-            foreach (var line in RenderCandidates(candidates, hasIncumbent, incumbentZ, incumbentPath))
-                log.Add(line);
-
-            if (!hasIncumbent)
+            if (!haveIncumbent)
             {
-                log.Add("No integer feasible solution found.");
-                return new SolverResult(false, 0, Array.Empty<double>(), log);
+                log.Add("Search finished with no incumbent. Likely infeasible after branching.");
+                return new SolverResult(false, 0, Array.Empty<double>(), log, infeasible: true);
             }
 
-            log.Add($"\n== Best Integer Solution ==\nObjective: {F(incumbentZ)}");
-            log.Add($"Backtrace: {incumbentPath}");
-
-            // Display decision variables for the best candidate
-            log.Add("\n== Decision Variables (Best Candidate) ==");
-            for (int i = 0; i < incumbentX.Length; i++)
-            {
-                var varName = model.Variables[i].Name ?? $"x{i + 1}";
-                log.Add($"{varName} = {F(incumbentX[i])}");
-            }
-
-            // Return INTERNAL objective
-            return new SolverResult(true, InternalObjective(model.Direction, incumbentZ), incumbentX, log);
+            return new SolverResult(true, incumbentValue, incumbentX, log);
         }
 
-        // ----------------------- helpers -----------------------
-        private static IEnumerable<int> DetectIntegerIndices(LpModel model)
+        // -----------------------------
+        // Helpers: logging / finish
+        // -----------------------------
+        private static string Fmt(double v) => v.ToString("0.########", CultureInfo.InvariantCulture);
+
+        private static bool Better(OptimizeDirection dir, double a, double b)
+            => IsMaximization(dir) ? a > b + 1e-12 : a < b - 1e-12;
+
+        private static bool IsMaximization(OptimizeDirection dir)
         {
-            for (int j = 0; j < model.NumVars; j++)
-            {
-                var s = model.Variables[j].Sign;
-                if (s == SignRestriction.Int || s == SignRestriction.Bin)
-                    yield return j;
-            }
+            // Works regardless of exact enum member names
+            var s = dir.ToString();
+            return s.IndexOf("max", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
-        private static LpModel CloneModel(LpModel src)
-        {
-            var m = new LpModel(src.Direction);
-            foreach (var v in src.Variables)
-                m.Variables.Add(new Variable(v.Name, v.ObjectiveCoeff, v.Sign));
-            foreach (var c in src.Constraints)
-                m.Constraints.Add(new Constraint((double[])c.Coeffs.Clone(), c.Relation, c.Rhs));
-            return m;
-        }
-
-        private static void AddBoundRow(LpModel m, int j, Relation rel, double rhs)
-        {
-            var row = new double[m.NumVars];
-            row[j] = 1.0; // coefficient on x_j
-            m.Constraints.Add(new Constraint(row, rel, rhs));
-        }
-
-        private static List<(int j, double? lb, double? ub)> CopyBounds(List<(int j, double? lb, double? ub)> b)
-            => b.Select(t => (t.j, t.lb, t.ub)).ToList();
-
+        // -----------------------------
+        // Helpers: integrality, branching choice
+        // -----------------------------
         private static bool IsIntegral(double[] x, int[] intIdx)
         {
             foreach (var j in intIdx)
             {
-                double frac = Math.Abs(x[j] - Math.Round(x[j]));
-                if (frac > INT_TOL) return false;
+                if (j < 0 || j >= x.Length) continue;
+                if (Math.Abs(x[j] - Math.Round(x[j])) > INT_TOL) return false;
             }
             return true;
         }
 
-        private static double[] RoundToIntegers(double[] x, int[] intIdx)
+        private static int ChooseFractional(double[] x, int[] intIdx, out double value)
         {
-            var y = (double[])x.Clone();
-            foreach (var j in intIdx) y[j] = Math.Round(y[j]);
-            return y;
-        }
+            // Heuristic: largest fractional part
+            int arg = -1;
+            double best = -1.0;
+            double vBest = 0.0;
 
-        /// <summary>Most fractional among the integer vars.</summary>
-        private static int ChooseBranchVar(double[] x, int[] intIdx)
-        {
-            int best = -1;
-            double bestFrac = -1.0;
             foreach (var j in intIdx)
             {
-                double fj = Math.Abs(x[j] - Math.Round(x[j]));
-                if (fj <= INT_TOL) continue;
-                if (fj > bestFrac) { bestFrac = fj; best = j; }
+                if (j < 0 || j >= x.Length) continue;
+                double v = x[j];
+                double frac = Math.Abs(v - Math.Round(v));
+                if (frac > INT_TOL && frac > best)
+                {
+                    best = frac; arg = j; vBest = v;
+                }
             }
-            return best;
-        }
 
-        private static void PrefixInto(List<string> target, IEnumerable<string> lines, string prefix)
-        {
-            foreach (var line in lines) target.Add(prefix + line);
-        }
-
-        private static void MergeInto(List<string> target, IEnumerable<string> lines)
-        {
-            foreach (var line in lines) target.Add(line);
-        }
-
-        private static IEnumerable<string> RenderCandidates(List<Candidate> candidates, bool hasIncumbent, double incumbentZ, string incumbentPath)
-        {
-            if (candidates.Count == 0) yield break;
-
-            foreach (var c in candidates.OrderBy(c => c.NodeId))
+            if (arg == -1)
             {
-                var status = c.IsIntegral ? "INTEGRAL" : "fractional";
-                yield return $"[Node {c.NodeId} | depth {c.Depth}] {status} z={F(c.Objective)} :: {c.Path}";
+                foreach (var j in intIdx)
+                {
+                    if (j < 0 || j >= x.Length) continue;
+                    double v = x[j];
+                    if (Math.Abs(v - Math.Round(v)) > INT_TOL) { arg = j; vBest = v; break; }
+                }
             }
-
-            if (hasIncumbent)
-                yield return $"Best: z={F(incumbentZ)} via {incumbentPath}";
+            if (arg == -1) { arg = 0; vBest = x.Length > 0 ? x[0] : 0.0; }
+            value = vBest;
+            return arg;
         }
 
-        private static string RenderSolutionVector(LpModel model, double[] x)
+        private static int[] ExtractIntegerIndices(LpModel model)
         {
-            var parts = new List<string>();
-            for (int k = 0; k < x.Length; k++)
+            // Try common property names via reflection; else default to all decision vars
+            var t = model.GetType();
+            int[] probe(string name)
             {
-                var name = model.Variables[k].Name ?? $"x{k + 1}";
-                parts.Add($"{name}={F(x[k])}");
+                var p = t.GetProperty(name);
+                if (p == null) return Array.Empty<int>();
+                var val = p.GetValue(model);
+                if (val is IEnumerable<int> seq) return seq.ToArray();
+                return Array.Empty<int>();
             }
-            return "x* (rounded ints on int/bin vars): [" + string.Join(", ", parts) + "]";
+            var names = new[] { "IntegerVarIndices", "IntIndices", "IntegerIndices", "IntegerVars", "IntegerVariables" };
+            foreach (var n in names)
+            {
+                var r = probe(n);
+                if (r.Length > 0) return r.Select(k => Math.Max(0, k - 1)).ToArray(); // handle 1-based storage
+            }
+            return Array.Empty<int>();
         }
 
-        // Convert solver's internal objective to the user's real objective
-        // (The simplex flips MIN → MAX; this flips back for reporting & pruning.)
-        private static double UserObjective(OptimizeDirection dir, double solverObj)
-            => dir == OptimizeDirection.Max ? solverObj : -solverObj;
+        // -----------------------------
+        // Build a Phase II tableau for the root (handles Phase I if needed)
+        // -----------------------------
+        private TableauState PhaseIThenPhaseII(LpModel model, List<string> log)
+        {
+            var canRes = Canonicalizer.ToCanonical(model);
+            var can = canRes.Canonical;
 
-        // Convert USER objective back to INTERNAL sign for returning SolverResult
-        private static double InternalObjective(OptimizeDirection dir, double userObj)
-            => dir == OptimizeDirection.Max ? userObj : -userObj;
+            if (can.PhaseIRequired)
+            {
+                // ---- Phase I (primal) ----
+                int m = can.NumRows, n = can.NumCols, width = n + 1;
+                var T1 = new double[m + 1, n + 1];
 
-        private static string F(double v) => v.ToString("0.######", CultureInfo.InvariantCulture);
+                // Fill constraints
+                for (int i = 0; i < m; i++)
+                {
+                    for (int j = 0; j < n; j++) T1[i + 1, j] = can.A[i, j];
+                    T1[i + 1, n] = can.b[i];
+                }
+                // Phase I objective = - sum(artificials)
+                for (int j = 0; j < n; j++) T1[0, j] = -can.cPhaseI[j];
+
+                // Basis detection (identity columns)
+                var basis = (can.BasicIdx ?? Array.Empty<int>()).ToArray();
+                if (!IsValidIdentityBasis(T1, basis, m, n)) basis = DetectIdentityBasis(T1, m, n);
+                if (!IsValidIdentityBasis(T1, basis, m, n))
+                    throw new Exception("Phase I: cannot detect a valid identity basis.");
+
+                // Canonicalize z-row for Phase I
+                CanonicalizeZRow(T1, basis, can.cPhaseI, m, n, width);
+
+                // Primal simplex (enter: most negative rc; leave: min ratio)
+                int it = 0;
+                while (it++ < 10000)
+                {
+                    int enter = -1; double minRC = -1e-18;
+                    for (int j = 0; j < n; j++)
+                    {
+                        double rc = T1[0, j];
+                        if (rc < minRC) { minRC = rc; enter = j; }
+                    }
+                    if (enter == -1) break; // optimal for Phase I
+
+                    int leave = -1; double theta = double.PositiveInfinity;
+                    for (int r = 0; r < m; r++)
+                    {
+                        double a = T1[r + 1, enter];
+                        if (a > EPS)
+                        {
+                            double t = T1[r + 1, n] / a;
+                            if (t >= 0 && t < theta) { theta = t; leave = r; }
+                        }
+                    }
+                    if (leave == -1) throw new Exception("Phase I: unbounded ascent.");
+
+                    Pivot(T1, leave + 1, enter, width);
+                    basis[leave] = enter;
+                }
+
+                if (Math.Abs(T1[0, n]) > 1e-7)
+                    throw new Exception("Phase I: infeasible (artificial sum not zero).");
+
+                // Drop artificial columns
+                var keep = Enumerable.Range(0, n).Where(j => !can.ArtificialIdx.Contains(j)).ToArray();
+                int n2 = keep.Length;
+                var T2 = new double[m + 1, n2 + 1];
+
+                for (int i = 0; i < m; i++)
+                {
+                    for (int jj = 0; jj < n2; jj++) T2[i + 1, jj] = T1[i + 1, keep[jj]];
+                    T2[i + 1, n2] = T1[i + 1, n];
+                }
+
+                // Phase II c
+                var c2 = new double[n2];
+                for (int jj = 0; jj < n2; jj++) c2[jj] = can.c[keep[jj]];
+
+                // Map basis into new columns
+                var pos = new Dictionary<int, int>();
+                for (int jj = 0; jj < n2; jj++) pos[keep[jj]] = jj;
+
+                var basis2 = new int[m];
+                for (int i = 0; i < m; i++)
+                {
+                    int jOld = basis[i];
+                    basis2[i] = pos.ContainsKey(jOld) ? pos[jOld] : -1;
+                }
+                var fixedBasis = IsValidIdentityBasis(T2, basis2, m, n2) ? basis2 : DetectIdentityBasis(T2, m, n2);
+                if (!IsValidIdentityBasis(T2, fixedBasis, m, n2))
+                    throw new Exception("Phase I: failed to reconstruct Phase II basis.");
+
+                // Phase II z-row = -c
+                for (int jj = 0; jj < n2; jj++) T2[0, jj] = -c2[jj];
+
+                CanonicalizeZRow(T2, fixedBasis, c2, m, n2, n2 + 1);
+
+                // Build CanonicalForm with BOTH basic and nonbasic indices
+                var nonBasic2 = Enumerable.Range(0, n2).Except(fixedBasis).ToArray();
+
+                return new TableauState
+                {
+                    Can = new CanonicalForm(
+                        A: ExtractA(T2, m, n2),
+                        b: Extractb(T2, m, n2),
+                        c: c2,
+                        z0: 0.0,
+                        basicIdx: fixedBasis,
+                        nonBasicIdx: nonBasic2)
+                    {
+                        NumRows = m,
+                        NumCols = n2,
+                        NumVarsOriginal = can.NumVarsOriginal,
+                        Map = can.Map
+                    },
+                    T = T2,
+                    Basis = fixedBasis,
+                    M = m,
+                    N = n2,
+                    P = can.NumVarsOriginal,
+                    ColNames = can.Map.ColumnNames,
+                    RowNames = can.Map.RowNames
+                };
+            }
+            else
+            {
+                // ---- Phase II directly ----
+                int m = can.NumRows, n = can.NumCols, width = n + 1;
+                var T = new double[m + 1, n + 1];
+                for (int i = 0; i < m; i++)
+                {
+                    for (int j = 0; j < n; j++) T[i + 1, j] = can.A[i, j];
+                    T[i + 1, n] = can.b[i];
+                }
+                for (int j = 0; j < n; j++) T[0, j] = -can.c[j];
+
+                var basis = (can.BasicIdx ?? Array.Empty<int>()).ToArray();
+                if (!IsValidIdentityBasis(T, basis, m, n)) basis = DetectIdentityBasis(T, m, n);
+                if (!IsValidIdentityBasis(T, basis, m, n))
+                    throw new Exception("Phase II: cannot detect a valid identity basis.");
+
+                CanonicalizeZRow(T, basis, can.c, m, n, width);
+
+                var nonBasic = Enumerable.Range(0, n).Except(basis).ToArray();
+
+                return new TableauState
+                {
+                    Can = new CanonicalForm(
+                        A: ExtractA(T, m, n),
+                        b: Extractb(T, m, n),
+                        c: can.c,
+                        z0: 0.0,
+                        basicIdx: basis,
+                        nonBasicIdx: nonBasic)
+                    {
+                        NumRows = m,
+                        NumCols = n,
+                        NumVarsOriginal = can.NumVarsOriginal,
+                        Map = can.Map
+                    },
+                    T = T,
+                    Basis = basis,
+                    M = m,
+                    N = n,
+                    P = can.NumVarsOriginal,
+                    ColNames = can.Map.ColumnNames,
+                    RowNames = can.Map.RowNames
+                };
+            }
+        }
+
+        // -----------------------------
+        // DUAL SIMPLEX (from current tableau)
+        // -----------------------------
+        private static (bool success, bool infeasible, bool unbounded, double z, double[] xDecision)
+        DualOptimizeFromHere(TableauState S)
+        {
+            int m = S.M, n = S.N, width = n + 1;
+            var T = S.T;
+            var basis = S.Basis.ToArray();
+            var basicSet = new HashSet<int>(basis);
+
+            int it = 0;
+            while (it++ < 10000)
+            {
+                int leave = FindLeavingRowDual(T, m, n);
+                if (leave == -1)
+                {
+                    double z = T[0, n];
+                    var xFull = ExtractPrimal(T, m, n, basis);
+                    var xDecision = xFull.Take(Math.Min(S.P, xFull.Length)).ToArray();
+                    return (true, false, false, z, xDecision);
+                }
+
+                int enter = FindEnteringColDual(T, leave, basicSet, n);
+                if (enter == -1)
+                {
+                    return (false, true, false, 0.0, Array.Empty<double>()); // infeasible
+                }
+
+                Pivot(T, leave + 1, enter, width);
+                basicSet.Remove(basis[leave]);
+                basis[leave] = enter;
+                basicSet.Add(enter);
+            }
+            return (false, false, false, 0.0, Array.Empty<double>()); // max iters
+        }
+
+        private static int FindLeavingRowDual(double[,] T, int m, int n)
+        {
+            int leave = -1; double mostNeg = -1e-18;
+            for (int r = 0; r < m; r++)
+            {
+                double b = T[r + 1, n];
+                if (b < mostNeg) { mostNeg = b; leave = r; }
+            }
+            return leave;
+        }
+
+        private static int FindEnteringColDual(double[,] T, int leave, HashSet<int> basicSet, int n)
+        {
+            int enter = -1;
+            double best = double.PositiveInfinity;
+            for (int j = 0; j < n; j++)
+            {
+                if (basicSet.Contains(j)) continue;
+                double a = T[leave + 1, j];
+                if (a < -EPS)
+                {
+                    double z = T[0, j];
+                    double ratio = z / a; // minimize
+                    if (ratio < best) { best = ratio; enter = j; }
+                }
+            }
+            return enter;
+        }
+
+        // -----------------------------
+        // c8 − c9 injection
+        // -----------------------------
+        private static void InjectBranchRow(TableauState S, int j, bool isUpper, double bound)
+        {
+            // Make x_j basic → "c8"
+            MakeVariableBasic(S, j);
+            int m = S.M, n = S.N;
+
+            int c8row = Array.FindIndex(S.Basis, b => b == j);
+            if (c8row < 0) throw new Exception("x_j is not basic after pivot (internal).");
+            int c8 = c8row + 1; // tableau row index
+
+            // Add new slack column and a new constraint row (at bottom)
+            int newN = n + 1;
+            var T2 = new double[m + 2, newN + 1];
+
+            // Copy all old rows (z-row plus existing constraints)
+            for (int r = 0; r < m + 1; r++)
+            {
+                for (int c = 0; c < n; c++) T2[r, c] = S.T[r, c];
+                T2[r, newN] = S.T[r, n]; // RHS
+            }
+            // z-row coefficient for the brand new slack = 0 (keeps reduced costs untouched)
+            T2[0, n] = 0.0;
+
+            // New row = (c8 − c9)
+            // Start with c8
+            for (int c = 0; c < n; c++) T2[m + 1, c] = S.T[c8, c];
+            T2[m + 1, newN] = S.T[c8, n]; // RHS
+
+            // Subtract c9:
+            // For x_j ≤ U:    c9: x_j + s_new = U
+            // For x_j ≥ L:    c9: x_j − s_new = L
+            T2[m + 1, j] -= 1.0;                          // subtract x_j
+            T2[m + 1, n] -= (isUpper ? +1.0 : -1.0);      // subtract (±s_new) at new slack column index n
+            T2[m + 1, newN] -= bound;                        // subtract RHS(U/L)
+
+            // If RHS > 0, flip entire new row so RHS becomes negative → perfect for Dual Simplex
+            if (T2[m + 1, newN] > 0)
+                for (int c = 0; c < newN + 1; c++) T2[m + 1, c] = -T2[m + 1, c];
+
+            // Update basis: new row is basic at the new slack column (index n)
+            var basis2 = new int[m + 1];
+            Array.Copy(S.Basis, basis2, m);
+            basis2[m] = n;
+
+            // Commit
+            S.T = T2;
+            S.Basis = basis2;
+            S.M = m + 1;
+            S.N = newN;
+        }
+
+        private static void MakeVariableBasic(TableauState S, int j)
+        {
+            int m = S.M, n = S.N, width = n + 1;
+            int row = Array.FindIndex(S.Basis, b => b == j);
+            if (row >= 0) return; // already basic
+
+            // Find a pivot row with nonzero in column j
+            int prow = -1;
+            for (int r = 0; r < m; r++)
+            {
+                if (Math.Abs(S.T[r + 1, j]) > EPS) { prow = r + 1; break; }
+            }
+            if (prow == -1) throw new Exception($"Column x{j + 1} has no pivot candidate (all zeros).");
+
+            Pivot(S.T, prow, j, width);
+            S.Basis[prow - 1] = j;
+        }
+
+        // -----------------------------
+        // Row ops / tableau ops
+        // -----------------------------
+        private static void Pivot(double[,] T, int prow, int pcol, int width)
+        {
+            double piv = T[prow, pcol];
+            if (Math.Abs(piv) < 1e-16) throw new Exception("Pivot on ~zero.");
+
+            // scale pivot row to make pivot = 1
+            double inv = 1.0 / piv;
+            for (int c = 0; c < width; c++) T[prow, c] *= inv;
+
+            // eliminate pcol from all other rows (including z-row)
+            int rows = T.GetLength(0);
+            for (int r = 0; r < rows; r++)
+            {
+                if (r == prow) continue;
+                double factor = T[r, pcol];
+                if (Math.Abs(factor) < 1e-16) continue;
+                for (int c = 0; c < width; c++)
+                    T[r, c] -= factor * T[prow, c];
+            }
+        }
+
+        private static void AddScaledRow(double[,] T, int targetRow, int srcRow, double scale, int width)
+        {
+            if (Math.Abs(scale) < 1e-16) return;
+            for (int c = 0; c < width; c++) T[targetRow, c] += scale * T[srcRow, c];
+        }
+
+        private static bool IsValidIdentityBasis(double[,] T, int[] basis, int m, int n)
+        {
+            if (basis.Length != m) return false;
+            for (int r = 0; r < m; r++)
+            {
+                int j = basis[r];
+                if (j < 0 || j >= n) return false;
+                if (Math.Abs(T[r + 1, j] - 1.0) > 1e-9) return false;
+                for (int rr = 0; rr < m; rr++)
+                {
+                    if (rr == r) continue;
+                    if (Math.Abs(T[rr + 1, j]) > 1e-9) return false;
+                }
+            }
+            return true;
+        }
+
+        private static int[] DetectIdentityBasis(double[,] T, int m, int n)
+        {
+            var basis = Enumerable.Repeat(-1, m).ToArray();
+            var used = new HashSet<int>();
+            for (int r = 0; r < m; r++)
+            {
+                for (int j = 0; j < n; j++)
+                {
+                    if (used.Contains(j)) continue;
+                    if (Math.Abs(T[r + 1, j] - 1.0) > 1e-9) continue;
+                    bool ok = true;
+                    for (int rr = 0; rr < m; rr++)
+                    {
+                        if (rr == r) continue;
+                        if (Math.Abs(T[rr + 1, j]) > 1e-9) { ok = false; break; }
+                    }
+                    if (ok) { basis[r] = j; used.Add(j); break; }
+                }
+                if (basis[r] == -1) return Array.Empty<int>();
+            }
+            return basis;
+        }
+
+        private static void CanonicalizeZRow(double[,] T, int[] basis, double[] c, int m, int n, int width)
+        {
+            for (int r = 0; r < m; r++)
+            {
+                double cb = c[basis[r]];
+                if (Math.Abs(cb) > EPS) AddScaledRow(T, 0, r + 1, cb, width);
+            }
+        }
+
+        private static double[] ExtractPrimal(double[,] T, int m, int n, int[] basis)
+        {
+            var x = new double[n];
+            for (int r = 0; r < m; r++)
+            {
+                int j = basis[r];
+                if (j >= 0 && j < n) x[j] = T[r + 1, n];
+            }
+            return x;
+        }
+
+        private static double[,] ExtractA(double[,] T, int m, int n)
+        {
+            var A = new double[m, n];
+            for (int i = 0; i < m; i++)
+                for (int j = 0; j < n; j++)
+                    A[i, j] = T[i + 1, j];
+            return A;
+        }
+
+        private static double[] Extractb(double[,] T, int m, int n)
+        {
+            var b = new double[m];
+            for (int i = 0; i < m; i++) b[i] = T[i + 1, n];
+            return b;
+        }
+
+        private static TableauState CloneTableau(TableauState s)
+        {
+            var T2 = (double[,])s.T.Clone();
+            var basis2 = (int[])s.Basis.Clone();
+            return new TableauState
+            {
+                Can = s.Can,
+                T = T2,
+                Basis = basis2,
+                M = s.M,
+                N = s.N,
+                P = s.P,
+                ColNames = s.ColNames,
+                RowNames = s.RowNames
+            };
+        }
     }
 }
