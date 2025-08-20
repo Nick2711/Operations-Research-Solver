@@ -58,7 +58,10 @@ namespace Server.Controllers
                     Algorithm.BranchAndBound => new BranchAndBoundSimplexSolver(),
                     _ => new PrimalSimplexSolver()
                 };
-
+                if (model.Direction == OptimizeDirection.Min && req.Algorithm != Algorithm.BranchAndBound)
+                {
+                    solver = new DualSimplexSolver();
+                }
                 token.ThrowIfCancellationRequested();
 
                 var result = solver.Solve(model);

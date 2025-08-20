@@ -14,7 +14,8 @@ namespace Solver.Engine.Integer
         private const double EPS = 1e-9;
         private const double INT_TOL = 1e-6;
 
-        private readonly PrimalSimplexSolver _primal = new();
+        // 🔁 Use Dual Simplex for every LP relaxation (root + all nodes)
+        private readonly DualSimplexSolver _dual = new();
 
         // NodeState: Holds information for each node during the Branch & Bound search
         private sealed class NodeState
@@ -71,22 +72,24 @@ namespace Solver.Engine.Integer
             var log = new List<string>();
             log.Add("== Branch & Bound (Tableau) ==");
             log.Add($"Direction: {model.Direction} | Vars: {model.NumVars} | Cons: {model.NumConstraints}");
+            log.Add("LP relaxations solved with: Dual Simplex");
 
             var intIdx = DetectIntegerIndices(model).ToArray();
             if (intIdx.Length == 0)
             {
-                log.Add("No integer/binary variables detected. Solving as pure LP.");
-                var pure = _primal.Solve(model);
+                log.Add("No integer/binary variables detected. Solving as pure LP (Dual Simplex).");
+                var pure = _dual.Solve(model);
                 pure.Log.Insert(0, "== Root LP (no integer vars) ==");
                 MergeInto(log, pure.Log);
+                // Return INTERNAL objective (consistent with other solvers)
                 return new SolverResult(pure.Success, pure.ObjectiveValue, pure.X, log, pure.Unbounded, pure.Infeasible);
             }
 
             log.Add($"Integer variable indices (1-based): {string.Join(", ", intIdx.Select(i => (i + 1).ToString()))}");
 
             // Root relaxation
-            log.Add("\n== Root LP Relaxation ==");
-            var rootLP = _primal.Solve(model);
+            log.Add("\n== Root LP Relaxation (Dual) ==");
+            var rootLP = _dual.Solve(model);
             PrefixInto(log, rootLP.Log, "- ");
 
             if (rootLP.Infeasible)
@@ -134,7 +137,8 @@ namespace Solver.Engine.Integer
                     log.Add($"{varName} = {F(incumbentX[i])}");
                 }
 
-                return new SolverResult(true, incumbentZ, incumbentX, log);
+                // Return INTERNAL objective
+                return new SolverResult(true, InternalObjective(model.Direction, incumbentZ), incumbentX, log);
             }
 
             // DFS stack
@@ -150,12 +154,12 @@ namespace Solver.Engine.Integer
             {
                 var node = stack.Pop();
 
-                // Build a child LP with all branch rows
+                // Build a child LP with all branch rows (bounds)
                 var childModel = CloneModel(model);
                 foreach (var (j, lb, ub) in node.Bounds)
                 {
                     if (lb.HasValue) AddBoundRow(childModel, j, Relation.GreaterOrEqual, lb.Value); // x_j ≥ lb
-                    if (ub.HasValue) AddBoundRow(childModel, j, Relation.LessOrEqual, ub.Value);   // x_j ≤ ub
+                    if (ub.HasValue) AddBoundRow(childModel, j, Relation.LessOrEqual, ub.Value); // x_j ≤ ub
                 }
 
                 log.Add($"\n== Node {node.Id} (depth {node.Depth}) :: {node.Path} ==");
@@ -172,7 +176,8 @@ namespace Solver.Engine.Integer
                     log.Add("Added bound rows: " + string.Join(", ", added));
                 }
 
-                var res = _primal.Solve(childModel);
+                // 🔁 Solve LP relaxation at node with Dual Simplex
+                var res = _dual.Solve(childModel);
                 PrefixInto(log, res.Log, "- ");
 
                 if (res.Infeasible) { log.Add("→ Pruned (infeasible)."); continue; }
@@ -195,7 +200,7 @@ namespace Solver.Engine.Integer
                     {
                         log.Add($"\n-- Branch outcome @ Node {pId} ({br.ParentPath}) on {br.VarName} = {F(br.Xval)} --");
                         log.Add($"   Left  ({br.VarName} ≤ {F(br.Floor)}): {br.LeftStatus}" + (br.LeftZ.HasValue ? $"  z={F(br.LeftZ.Value)}" : ""));
-                        log.Add($"   Right ({br.VarName} ≥ {F(br.Ceil)}): {br.RightStatus}" + (br.RightZ.HasValue ? $"  z={F(br.RightZ.Value)}" : ""));
+                        log.Add($"   Right ({br.VarName} ≥ {F(br.Ceil)}):  {br.RightStatus}" + (br.RightZ.HasValue ? $"  z={F(br.RightZ.Value)}" : ""));
 
                         string bestSide = "?";
                         if (childModel.Direction == OptimizeDirection.Min)
@@ -314,7 +319,8 @@ namespace Solver.Engine.Integer
                 log.Add($"{varName} = {F(incumbentX[i])}");
             }
 
-            return new SolverResult(true, incumbentZ, incumbentX, log);
+            // Return INTERNAL objective
+            return new SolverResult(true, InternalObjective(model.Direction, incumbentZ), incumbentX, log);
         }
 
         // ----------------------- helpers -----------------------
@@ -418,6 +424,10 @@ namespace Solver.Engine.Integer
         // (The simplex flips MIN → MAX; this flips back for reporting & pruning.)
         private static double UserObjective(OptimizeDirection dir, double solverObj)
             => dir == OptimizeDirection.Max ? solverObj : -solverObj;
+
+        // Convert USER objective back to INTERNAL sign for returning SolverResult
+        private static double InternalObjective(OptimizeDirection dir, double userObj)
+            => dir == OptimizeDirection.Max ? userObj : -userObj;
 
         private static string F(double v) => v.ToString("0.######", CultureInfo.InvariantCulture);
     }

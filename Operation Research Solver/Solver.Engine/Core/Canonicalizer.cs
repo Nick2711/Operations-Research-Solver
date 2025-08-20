@@ -19,9 +19,10 @@ namespace Solver.Engine.Core
 
             // Step 1: ensure Max
             double dirSign = model.Direction == OptimizeDirection.Max ? 1.0 : -1.0;
+            bool preferDual = model.Direction == OptimizeDirection.Min; // <- dual setup for Min
             log.Add(model.Direction == OptimizeDirection.Max
-                ? "Objective: already Max(Z) — no flip."
-                : "Objective: Min detected — multiplying objective by -1 to convert to Max(Z).");
+                ? "Objective: already Max(Z)"
+                : "Objective: Min detected ");
 
             // Step 2: expand variables to nonnegatives
             var varMap = new List<(int originalIndex, int[] newIndices, double[] multipliers)>();
@@ -70,7 +71,10 @@ namespace Solver.Engine.Core
                 }
             }
 
-            // Step 3: build rows, normalize RHS >= 0 (flip row & relation if needed)
+            // Step 3: build rows
+            // Dual setup for Min: 
+            //  - Convert '≥' rows by multiplying by -1 to '≤'
+            //  - Do NOT force RHS ≥ 0 (keep negatives for dual pivoting)
             var rows = new List<double[]>();
             var b = new List<double>();
             var rels = new List<Relation>();
@@ -91,8 +95,18 @@ namespace Solver.Engine.Core
                 double rhs = ct.Rhs;
                 var rel = ct.Relation;
 
-                // normalize RHS >= 0
-                if (rhs < 0)
+                // For Min (dual), first convert ≥ to ≤ by multiplying row by -1.
+                if (preferDual && rel == Relation.GreaterOrEqual)
+                {
+                    for (int k = 0; k < row.Length; k++) row[k] *= -1.0;
+                    rhs *= -1.0;
+                    rel = Relation.LessOrEqual;
+                    log.Add($"c{ci + 1}: Min+‘≥’ → multiply row by -1; relation becomes ≤; RHS={rhs}.");
+                }
+
+                // Normalize RHS≥0 only for primal style. For dual (Min), KEEP RHS sign as-is.
+                bool normalizeRhs = !preferDual;
+                if (normalizeRhs && rhs < 0)
                 {
                     for (int k = 0; k < row.Length; k++) row[k] *= -1.0;
                     rhs *= -1.0;
@@ -158,7 +172,8 @@ namespace Solver.Engine.Core
 
                     case Relation.GreaterOrEqual:
                         {
-                            // surplus r_i with -1 on row i
+                            // In Min/dual path we already converted ≥ to ≤ earlier, so this branch
+                            // only occurs when preferDual=false (primal setup).
                             int colSur = col;
                             foreach (var r in augRows) r.Add(0.0);
                             augRows[i][col] = -1.0;
@@ -166,7 +181,6 @@ namespace Solver.Engine.Core
                             surplusCount++;
                             col++;
 
-                            // artificial a_i with +1 on row i (enters basis)
                             int colArt = col;
                             foreach (var r in augRows) r.Add(0.0);
                             augRows[i][col] = 1.0;
@@ -209,7 +223,7 @@ namespace Solver.Engine.Core
             for (int k = 0; k < artIdx.Count; k++) colNames[artIdx[k]] = $"a{k + 1}";
             var rowNames = Enumerable.Range(1, m).Select(i => $"c{i}").ToArray();
 
-            // Build name map (after A is finalized)
+            // Build name map
             var rowToAdded = new int[m][];
             for (int i = 0; i < m; i++)
             {
@@ -233,8 +247,8 @@ namespace Solver.Engine.Core
             log.Add($"Canonicalized: m={m}, n={n} (vars={newVarCount}, slacks={slackCount}, surplus={surplusCount}, artificials={artCount}).");
             log.Add($"Basis: {(phaseIRequired ? "artificials/slacks" : "slacks only")}. z0 = 0.");
             if (phaseIRequired) log.Add("Phase I is required (artificials present).");
+            if (preferDual) log.Add("Dual setup: RHS signs retained (negatives allowed) — Dual Simplex will restore primal feasibility.");
 
-            // Build CanonicalForm with back-compat ctor, then fill Phase-I metadata
             var cf = new CanonicalForm(A, b.ToArray(), c, 0.0, basic, nonBasic)
             {
                 PhaseIRequired = phaseIRequired,
