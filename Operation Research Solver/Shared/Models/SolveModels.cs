@@ -5,6 +5,7 @@ public enum Algorithm
     PrimalSimplex,
     RevisedSimplex = 1,
     BranchAndBound = 2,
+    Knapsack01 = 3,
     // add more later...
 }
 

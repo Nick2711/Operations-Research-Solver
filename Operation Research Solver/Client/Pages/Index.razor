@@ -116,7 +116,9 @@
                                 <select id="algorithm" class="w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500" @bind="request.Algorithm">
                                     <option value="@Algorithm.PrimalSimplex">Primal Simplex</option>
                                     <option value="@Algorithm.RevisedSimplex">Revised Simplex</option>
-                                    <option value="@Algorithm.BranchAndBound">Branch &amp; Bound (Tableau)</option>
+                                    <option value="@Algorithm.BranchAndBound">Branch &amp; Bound</option>
+                                    <!-- <option value="@Algorithm.CuttingPlanes">Cutting Planes</option> -->
+                                     <option value="@Algorithm.Knapsack01">Knapsack</option>
                                 </select>
                             </div>
                             <button id="runSolverBtn" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-4 rounded-md transition flex items-center justify-center"

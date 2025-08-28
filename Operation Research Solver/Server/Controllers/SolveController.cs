@@ -1,7 +1,9 @@
-﻿using System.Diagnostics;
+﻿using System;
+using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
 using System.Text;
+using System.Threading;
 using Microsoft.AspNetCore.Mvc;
 using Shared.Models;
 
@@ -27,7 +29,7 @@ namespace Server.Controllers
             if (string.IsNullOrWhiteSpace(req.ModelText))
                 return BadRequest(new SolveResponse { OutputText = "Error: ModelText is empty." });
 
-            // Time limit
+            // Time limit (optional)
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             if (req.Settings != null && req.Settings.TimeLimitSeconds > 0)
                 cts.CancelAfter(TimeSpan.FromSeconds(req.Settings.TimeLimitSeconds));
@@ -35,9 +37,8 @@ namespace Server.Controllers
 
             try
             {
-                // Parse text -> model (parser owns normalization/cleaning)
-                var raw = req.ModelText ?? string.Empty;
-                var model = ModelParser.Parse(raw);
+                // Parse text -> model (ModelParser owns normalization/cleaning and algebraic fallback)
+                var model = ModelParser.Parse(req.ModelText);
 
                 if (model == null)
                 {
@@ -53,15 +54,21 @@ namespace Server.Controllers
                 // Pick solver from enum
                 ISolver solver = req.Algorithm switch
                 {
-                    Algorithm.PrimalSimplex => new PrimalSimplexSolver(),
-                    Algorithm.RevisedSimplex => new RevisedSimplexSolver(),
+                    Algorithm.Knapsack01 => new Knapsack01Solver(),
                     Algorithm.BranchAndBound => new BranchAndBoundSimplexSolver(),
+                    Algorithm.RevisedSimplex => new RevisedSimplexSolver(),
+                    Algorithm.PrimalSimplex => new PrimalSimplexSolver(),
                     _ => new PrimalSimplexSolver()
                 };
-                if (model.Direction == OptimizeDirection.Min && req.Algorithm != Algorithm.BranchAndBound)
+
+                // If MIN and caller didn't explicitly request BranchAndBound/Knapsack, prefer Dual Simplex
+                if (model.Direction == OptimizeDirection.Min &&
+                    req.Algorithm != Algorithm.BranchAndBound &&
+                    req.Algorithm != Algorithm.Knapsack01)
                 {
                     solver = new DualSimplexSolver();
                 }
+
                 token.ThrowIfCancellationRequested();
 
                 var result = solver.Solve(model);
@@ -76,12 +83,12 @@ namespace Server.Controllers
                 {
                     var linesToShow = (req.Settings?.Verbose ?? true)
                         ? result.Log
-                        : result.Log.Take(10);
+                        : result.Log.Take(100); // show more by default when not verbose
                     foreach (var l in linesToShow)
                         outText.AppendLine(l);
                 }
 
-                // Convert objective back to the user's original sense (we solve Max internally)
+                // Convert objective to the user's original sense (if solvers normalized internally)
                 double userObjective = result.Success
                     ? (model.Direction == OptimizeDirection.Max
                         ? result.ObjectiveValue
@@ -96,14 +103,14 @@ namespace Server.Controllers
                     if (result.X is { Length: > 0 })
                     {
                         var sol = string.Join(", ",
-                            result.X.Select((v, i) => $"x{i + 1}={v.ToString("0.###", CultureInfo.InvariantCulture)}"));
+                            result.X.Select((v, i) => $"x{i + 1}={(double.IsNaN(v) ? "NaN" : v.ToString("0.###", CultureInfo.InvariantCulture))}"));
                         outText.AppendLine("Solution: " + sol);
                     }
                 }
                 else
                 {
                     outText.AppendLine(result.Unbounded ? "FAILED — Unbounded."
-                                   : result.Infeasible ? "FAILED — Infeasible (Phase I needed)."
+                                   : result.Infeasible ? "FAILED — Infeasible."
                                    : "FAILED — Unknown.");
                 }
 
@@ -130,9 +137,30 @@ namespace Server.Controllers
             catch (Exception ex)
             {
                 sw.Stop();
+
+                // 🔎 Echo normalized lines to diagnose invisible characters / tokenization issues
+                string normalized;
+                try
+                {
+                    normalized = string.Join("\n", ModelParser.DebugNormalizeToLines(req.ModelText));
+                }
+                catch
+                {
+                    normalized = "(failed to normalize)";
+                }
+
+                var msg = new StringBuilder();
+                msg.AppendLine($"Error: {ex.Message}");
+                msg.AppendLine();
+                msg.AppendLine("--- Normalized lines ---");
+                msg.AppendLine(normalized);
+
                 return BadRequest(new SolveResponse
                 {
-                    OutputText = $"Error: {ex.Message}",
+                    Success = false,
+                    OutputText = msg.ToString(),
+                    Objective = null,
+                    SolutionSummary = null,
                     RuntimeMs = sw.ElapsedMilliseconds
                 });
             }
