@@ -11,6 +11,7 @@ using Solver.Engine.IO;
 using Solver.Engine.Simplex;
 using Solver.Engine.Core;
 using Solver.Engine.Integer;
+using Solver.Engine.CuttingPlanes;
 
 namespace Server.Controllers
 {
@@ -56,6 +57,7 @@ namespace Server.Controllers
                 {
                     Algorithm.Knapsack01 => new Knapsack01Solver(),
                     Algorithm.BranchAndBound => new BranchAndBoundSimplexSolver(),
+                    Algorithm.CuttingPlane => new CuttingPlaneSolver(),
                     Algorithm.RevisedSimplex => new RevisedSimplexSolver(),
                     Algorithm.PrimalSimplex => new PrimalSimplexSolver(),
                     _ => new PrimalSimplexSolver()

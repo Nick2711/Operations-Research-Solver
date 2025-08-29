@@ -3,6 +3,7 @@
 @using Microsoft.AspNetCore.Components.Forms
 @inject HttpClient Http
 @inject IJSRuntime JS
+@using Shared.Models
 
 <div class="container mx-auto px-4 py-8 max-w-6xl">
     <!-- Header Section -->
@@ -113,13 +114,16 @@
                             <h3 class="text-lg font-medium text-gray-800 mb-3">Algorithm Selection</h3>
                             <div class="mb-4">
                                 <label for="algorithm" class="block text-sm font-medium text-gray-700 mb-1">Choose solving method:</label>
-                                <select id="algorithm" class="w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500" @bind="request.Algorithm">
+                                <InputSelect id="algorithm"
+                                             class="w-full border rounded px-2 py-1"
+                                             @bind-Value="request.Algorithm"
+                                             TValue="Algorithm">
                                     <option value="@Algorithm.PrimalSimplex">Primal Simplex</option>
                                     <option value="@Algorithm.RevisedSimplex">Revised Simplex</option>
                                     <option value="@Algorithm.BranchAndBound">Branch &amp; Bound</option>
-                                    <!-- <option value="@Algorithm.CuttingPlanes">Cutting Planes</option> -->
-                                     <option value="@Algorithm.Knapsack01">Knapsack</option>
-                                </select>
+                                    <option value="@Algorithm.Knapsack01">0–1 Knapsack</option>
+                                    <option value="@Algorithm.CuttingPlane">Cutting Plane (Gomory)</option>
+                                </InputSelect>
                             </div>
                             <button id="runSolverBtn" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-4 rounded-md transition flex items-center justify-center"
                                     @onclick="RunSolver">

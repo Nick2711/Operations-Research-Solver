@@ -6,6 +6,7 @@ public enum Algorithm
     RevisedSimplex = 1,
     BranchAndBound = 2,
     Knapsack01 = 3,
+    CuttingPlane = 4,
     // add more later...
 }
 
