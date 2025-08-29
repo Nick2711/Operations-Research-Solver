@@ -14,13 +14,15 @@ namespace Solver.Engine.Integer
     /// 2) Find rows with fractional RHS whose BASIC var is a decision x_j.
     /// 3) Create two subproblems (structure only) and
     /// 4) Re-opt each child with DUAL SIMPLEX (logs + final tableaus).
+    /// Then recurse depth-first on the dual-optimal children until all basic x rows are integral.
     /// </summary>
     public sealed class BranchAndBoundSimplexSolver : ISolver
     {
         public string Name => "Branch & Bound (Tableau)";
-
         private const double EPS = 1e-9;
         private const double INT_TOL = 1e-6;
+        private const int MAX_ITERS = 10000;
+        private const int MAX_NODES = 10000;
 
         public SolverResult Solve(LpModel model)
         {
@@ -29,9 +31,9 @@ namespace Solver.Engine.Integer
             log.Add("ok B&B algorithm");
             log.Add("Optimal table from relaxed primal");
 
-            // 1) Build Phase-II tableau (≤, x≥0) and optimize with PRIMAL; no step logs
+            // ---------- root primal (unchanged) ----------
             var T = BuildPhaseIIFromModel(model);
-            var basis = Enumerable.Range(model.NumVars, model.NumConstraints).ToArray(); // start with slacks
+            var basis = Enumerable.Range(model.NumVars, model.NumConstraints).ToArray();
             var root = PrimalOptimizeToOptimal(T, basis);
             if (!root.success)
             {
@@ -39,88 +41,125 @@ namespace Solver.Engine.Integer
                 return new SolverResult(false, 0, Array.Empty<double>(), log, infeasible: root.infeasible);
             }
 
-            // Print optimal relaxed tableau (decimals)
             PrintTable("═══════════════════════════════════════════════════════════════════════\nOptimal LP tableau", T, basis, model.NumVars, log);
             log.Add($"Objective (z) = {Fmt(T[0, T.GetLength(1) - 1])}");
             log.Add("");
 
-            // 2) Find fractional RHS rows where BASIC column is a decision variable
-            var cand = FindFractionalBasicXRows(T, basis, model.NumVars);
+            var firstCand = FindFractionalBasicXRows(T, basis, model.NumVars);
             log.Add("Branch & Bound — fractional basic x rows");
             log.Add("row\tbasic\tvalue\tfrac");
-            foreach (var r in cand) log.Add($"{r.rowIndex}\t{xName(r.basicJ)}\t{Fmt(r.value)}\t{Fmt(r.frac)}");
-
-            if (cand.Count == 0)
-            {
-                var xRelax = ExtractX(T, basis, model.NumVars);
-                double zRelax = T[0, T.GetLength(1) - 1];
-                return new SolverResult(true, zRelax, xRelax, log);
-            }
-
-            var chosen = ChooseByClosestToHalf(cand);
-            log.Add($"\nSelected for branching (rule: closest to 0.5, tie→leftmost): row {chosen.rowIndex}, {xName(chosen.basicJ)} = {Fmt(chosen.value)} (frac {Fmt(chosen.frac)})");
+            foreach (var r in firstCand) log.Add($"{r.rowIndex}\t{xName(r.basicJ)}\t{Fmt(r.value)}\t{Fmt(r.frac)}");
             log.Add("");
 
-            // Aliases
-            int branchRowOneBased = chosen.rowIndex + 1;
-            int j = chosen.basicJ;
-            double U = Math.Floor(chosen.value + 1e-12);
-            double Lb = Math.Ceiling(chosen.value - 1e-12);
+            // ---------- full DFS, NO bound-pruning ----------
+            bool haveIncumbent = false;
+            double incumbentZ = double.NegativeInfinity;
+            double[] incumbentX = Array.Empty<double>();
+            int visited = 0;
 
-            // 3a) Subproblem 1: x_j ≤ floor(b)  (add slack)  →  4) Dual Simplex
+            void ConsiderCandidate(string label, double[,] Tn, int[] Bn)
             {
-                var child = AddBranchConstraintExact(
-                    parentT: T, parentBasis: basis,
-                    branchRowOneBased: branchRowOneBased,
-                    varCol: j, isUpper: true, bound: U,
-                    log: log, subLabel: $"Subproblem 1: {xName(j)} ≤ {Fmt(U)} (add slack)"
-                );
-
-                log.Add("Dual Simplex — re-optimizing Subproblem 1");
-                var ok = DualOptimizeWithLogs(child.T, child.Basis, model.NumVars, log);
-                if (!ok.success)
+                double zn = Tn[0, ColsNoRhs(Tn)];
+                var xn = ExtractX(Tn, Bn, model.NumVars);
+                if (!haveIncumbent || zn > incumbentZ + 1e-12)
                 {
-                    if (ok.infeasible) log.Add("Result: infeasible node.");
-                    else log.Add("Result: dual simplex stalled.");
-                }
-                else
-                {
-                    log.Add("Final optimal tableau (Subproblem 1)");
-                    PrintTableInline(child.T, child.Basis, model.NumVars, log);
-                    log.Add($"Objective (z) = {Fmt(child.T[0, child.T.GetLength(1) - 1])}\n");
+                    haveIncumbent = true; incumbentZ = zn; incumbentX = xn;
+                    log.Add($"Candidate at {label}: all basic x RHS integral, z = {Fmt(zn)}");
+                    PrintTable("Optimal tableau (candidate)", Tn, Bn, model.NumVars, log);
                 }
             }
 
-            // 3b) Subproblem 2: x_j ≥ ceil(b)   (add excess) →  4) Dual Simplex
+            void Explore(double[,] Tnode, int[] Bnode, string label)
             {
-                var child = AddBranchConstraintExact(
-                    parentT: T, parentBasis: basis,
-                    branchRowOneBased: branchRowOneBased,
-                    varCol: j, isUpper: false, bound: Lb,
-                    log: log, subLabel: $"Subproblem 2: {xName(j)} ≥ {Fmt(Lb)} (add excess)"
-                );
+                if (++visited > MAX_NODES) { log.Add("Node limit reached; stopping search."); return; }
 
-                log.Add("Dual Simplex — re-optimizing Subproblem 2");
-                var ok = DualOptimizeWithLogs(child.T, child.Basis, model.NumVars, log);
-                if (!ok.success)
+                // stop this branch when integer-feasible (candidate)
+                if (IsIntegerBasicXRows(Tnode, Bnode, model.NumVars))
                 {
-                    if (ok.infeasible) log.Add("Result: infeasible node.");
-                    else log.Add("Result: dual simplex stalled.");
+                    ConsiderCandidate(label, Tnode, Bnode);
+                    return;
                 }
-                else
+
+                // choose fractional basic x row
+                var cands = FindFractionalBasicXRows(Tnode, Bnode, model.NumVars);
+                if (cands.Count == 0)
                 {
-                    log.Add("Final optimal tableau (Subproblem 2)");
-                    PrintTableInline(child.T, child.Basis, model.NumVars, log);
-                    log.Add($"Objective (z) = {Fmt(child.T[0, child.T.GetLength(1) - 1])}\n");
+                    // rare: nothing to branch on, treat as candidate
+                    ConsiderCandidate(label + " (no branchable rows)", Tnode, Bnode);
+                    return;
+                }
+                var chosen = ChooseByClosestToHalf(cands);
+                int r0 = chosen.rowIndex;
+                int j = chosen.basicJ;
+                double b = chosen.value;
+                double frac = chosen.frac;
+
+                log.Add($"Branch at {label}: row {r0 + 1}, {xName(j)} = {Fmt(b)} (frac {Fmt(frac)})");
+
+                // child 1: x_j ≤ floor(b)
+                {
+                    double U = Math.Floor(b + 1e-12);
+                    var child = AddBranchConstraintExact(
+                        parentT: Tnode, parentBasis: Bnode,
+                        branchRowOneBased: r0 + 1,
+                        varCol: j, isUpper: true, bound: U,
+                        log: log, subLabel: $"{label}.1: {xName(j)} ≤ {Fmt(U)} (add slack)"
+                    );
+
+                    log.Add($"{label}.1 — Dual Simplex re-optimization");
+                    var dual = DualOptimizeWithLogs(child.T, child.Basis, model.NumVars, log);
+                    if (!dual.success)
+                    {
+                        log.Add(dual.infeasible ? $"{label}.1: infeasible → prune." : $"{label}.1: dual stalled → prune.");
+                    }
+                    else
+                    {
+                        PrintTable($"{label}.1 — Dual simplex optimal tableau", child.T, child.Basis, model.NumVars, log);
+                        // **no bound pruning** → always explore feasible child
+                        Explore(child.T, child.Basis, label + ".1");
+                    }
+                }
+
+                // child 2: x_j ≥ ceil(b)
+                {
+                    double Lb = Math.Ceiling(b - 1e-12);
+                    var child = AddBranchConstraintExact(
+                        parentT: Tnode, parentBasis: Bnode,
+                        branchRowOneBased: r0 + 1,
+                        varCol: j, isUpper: false, bound: Lb,
+                        log: log, subLabel: $"{label}.2: {xName(j)} ≥ {Fmt(Lb)} (add excess)"
+                    );
+
+                    log.Add($"{label}.2 — Dual Simplex re-optimization");
+                    var dual = DualOptimizeWithLogs(child.T, child.Basis, model.NumVars, log);
+                    if (!dual.success)
+                    {
+                        log.Add(dual.infeasible ? $"{label}.2: infeasible → prune." : $"{label}.2: dual stalled → prune.");
+                    }
+                    else
+                    {
+                        PrintTable($"{label}.2 — Dual simplex optimal tableau", child.T, child.Basis, model.NumVars, log);
+                        // **no bound pruning** → always explore feasible child
+                        Explore(child.T, child.Basis, label + ".2");
+                    }
                 }
             }
 
-            // Stop here (prototype) — return relaxed solution of the root
-            var xrel = ExtractX(T, basis, model.NumVars);
-            var zrel = T[0, T.GetLength(1) - 1];
-            log.Add($"\nSUCCESS — Objective: {Fmt(zrel)}");
-            log.Add($"Solution: {string.Join(", ", xrel.Select((v, i) => $"x{i + 1}={Fmt(v)}"))}");
-            return new SolverResult(true, zrel, xrel, log);
+            Explore(Clone(T), (int[])basis.Clone(), "1");
+
+            if (!haveIncumbent)
+            {
+                var xrel = ExtractX(T, basis, model.NumVars);
+                var zrel = T[0, T.GetLength(1) - 1];
+                log.Add("\nFinished without integer incumbent — returning relaxed solution.");
+                log.Add($"SUCCESS — Objective: {Fmt(zrel)}");
+                log.Add($"Solution: {string.Join(", ", xrel.Select((v, i) => $"x{i + 1}={Fmt(v)}"))}");
+                return new SolverResult(true, zrel, xrel, log);
+            }
+
+            log.Add($"\nSUCCESS — Objective: {Fmt(incumbentZ)}");
+            log.Add($"Solution: {string.Join(", ", incumbentX.Select((v, i) => $"x{i + 1}={Fmt(v)}"))}");
+            return new SolverResult(true, incumbentZ, incumbentX, log);
         }
 
         // ───────────────────────── exact row-build helper (branch row − skeleton, flip if RHS>0) ─────────────────────────
@@ -129,7 +168,7 @@ namespace Solver.Engine.Integer
         /// <summary>
         /// Build a child tableau by adding one branching constraint using:
         /// newRow = (branchRow) − (skeleton), across ALL columns including RHS.
-        /// If RHS &gt; 0, multiply the whole row by −1 so Dual Simplex can proceed.
+        /// If RHS > 0, multiply the whole row by −1 so Dual Simplex can proceed.
         /// New column’s reduced cost in z-row is 0; new row is basic at the new column.
         /// </summary>
         private static ChildTableau AddBranchConstraintExact(
@@ -368,7 +407,7 @@ namespace Solver.Engine.Integer
                 for (int c = 0; c <= n; c++) T[0, c] += cb * T[i + 1, c];
             }
 
-            for (int it = 0; it < 10000; it++)
+            for (int it = 0; it < MAX_ITERS; it++)
             {
                 // Enter = most negative reduced cost
                 int enter = -1; double minRc = -1e-12;
@@ -436,6 +475,21 @@ namespace Solver.Engine.Integer
             => cand.OrderBy(t => Math.Abs((t.value - Math.Floor(t.value)) - 0.5))
                    .ThenBy(t => t.basicJ).First();
 
+        private static bool IsIntegerBasicXRows(double[,] T, int[] basis, int numX)
+        {
+            int n = ColsNoRhs(T);
+            for (int i = 0; i < basis.Length; i++)
+            {
+                int j = basis[i];
+                if (j >= 0 && j < numX)
+                {
+                    double b = T[i + 1, n];
+                    if (Math.Abs(b - Math.Round(b)) > INT_TOL) return false;
+                }
+            }
+            return true;
+        }
+
         private static double[] ExtractX(double[,] T, int[] basis, int numX)
         {
             int n = ColsNoRhs(T);
@@ -446,6 +500,13 @@ namespace Solver.Engine.Integer
                 if (j >= 0 && j < numX) x[j] = T[i + 1, n];
             }
             return x;
+        }
+
+        private static double[,] Clone(double[,] T)
+        {
+            var c = new double[T.GetLength(0), T.GetLength(1)];
+            Array.Copy(T, c, T.Length);
+            return c;
         }
     }
 }
