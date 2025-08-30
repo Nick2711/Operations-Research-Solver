@@ -16,7 +16,7 @@ namespace Solver.Engine.CuttingPlanes
     /// </summary>
     public sealed class CuttingPlaneSolver : ISolver
     {
-        public string Name => "Cutting Planes (Gomory, Pretty)";
+        public string Name => "Gomory Cutting Plane (fractional)";
 
         private const double Eps = 1e-9;
         private const double IntTol = 1e-6;
@@ -76,22 +76,21 @@ namespace Solver.Engine.CuttingPlanes
             Tableau.PrintTable(ref tab, n, "Canonical Form", "(z)", snap, showTheta: false);
             logCP.Add(snap.ToString()); snap.Clear();
 
+            // Solve the LP relaxation (primal simplex with logs)
+            logCP.Add("───────────────────────────────────────────────────────────────────────");
+            logCP.Add("Initial (LP Relaxation)");
             if (!Tableau.PrimalSimplexSnapshots(ref tab, n, ref tableNo, logCP, MaxSimplexIter))
-            {
-                var bb = new BranchAndBoundSimplexSolver();
-                logCP.Add("LP relaxation failed → fallback.");
-                var res = bb.Solve(model);
-                if (res.Log is not null) logCP.AddRange(res.Log);
-                return new SolverResult(res.Success, res.ObjectiveValue, res.X, logCP, res.Unbounded, res.Infeasible);
-            }
+                return new SolverResult(false, 0, new double[n], logCP);
 
+            // Now iterate cuts
             int cuts = 0;
             while (true)
             {
-                var x = Tableau.ReadPrimalSolution(tab, n);
+                // Read current z and primal x
                 double z = tab.Z;
+                var x = Tableau.ReadPrimalSolution(tab, n);
 
-                // Are all decision variables integral?
+                // Already integral?
                 bool allInt = true;
                 for (int i = 0; i < n; i++)
                 {
@@ -119,7 +118,8 @@ namespace Solver.Engine.CuttingPlanes
                     return new SolverResult(true, approxZ, rounded, logCP);
                 }
 
-                var (fracAll, f0) = Tableau.BuildGomoryCut(tab, row);
+                // Build cut from the whole row (all nonbasic columns, including slacks)
+                var (fracAllCols, f0) = Tableau.BuildGomoryCut(tab, row);
                 int basicCol = tab.Basis[row];
                 string cutOn = basicCol < n ? $"x{basicCol + 1}" : $"s{basicCol - n + 1}";
 
@@ -127,23 +127,23 @@ namespace Solver.Engine.CuttingPlanes
                 logCP.Add($"Cutting Plane: Cut {cuts + 1}");
                 logCP.Add($"Cut {cutOn} ({reason})");
 
-                // FULL derivation (no ellipses)
-                logCP.AddRange(Tableau.DeriveCutStepsFull(tab, row, n, cutOn));
+                // Slide-style derivation lines
+                foreach (var line in Tableau.FormatGomoryDerivationLines(tab, row))
+                    logCP.Add(line);
 
-                // Add cut (≤ form across all columns) and print T-k*
-                Tableau.AddGomoryCut(ref tab, (fracAll, f0));
-                Tableau.PrintTable(ref tab, n, $"T-{tableNo}*", "z", snap, showTheta: false);
-                logCP.Add(snap.ToString()); snap.Clear();
-                tableNo++;
+                // Final inequality exactly like the slides
+                logCP.Add(Tableau.FormatFinalInequality(tab, row, fracAllCols, f0));
+                logCP.Add("Add as a new constraint row and re-solve (dual simplex).");
 
-                // Restore feasibility with Dual Simplex (robust entering rule)
+                // Extend tableau with the cut (add a new row with slack)
+                Tableau.AddLeqCut(ref tab, fracAllCols, f0);
+
+                // Dual simplex (since we create a negative RHS row)
                 if (!Tableau.DualSimplexSnapshots(ref tab, n, ref tableNo, logCP, MaxSimplexIter))
                 {
-                    var bb = new BranchAndBoundSimplexSolver();
-                    logCP.Add("Dual simplex could not proceed — falling back to Branch & Bound with current best.");
-                    var res = bb.Solve(model);
-                    if (res.Log is not null) logCP.AddRange(res.Log);
-                    return new SolverResult(res.Success, res.ObjectiveValue, res.X, logCP, res.Unbounded, res.Infeasible);
+                    logCP.Add("Dual simplex failed/limit: stopping.");
+                    var bestX = Tableau.ReadPrimalSolution(tab, n);
+                    return new SolverResult(true, tab.Z, bestX, logCP);
                 }
 
                 cuts++;
@@ -212,26 +212,30 @@ namespace Solver.Engine.CuttingPlanes
                 sb.AppendLine(title);
                 sb.AppendLine("\t" + string.Join("\t", head));
 
-                // z-row
-                var rowZ = new List<string>();
-                for (int j = 0; j < cols - 1; j++) rowZ.Add(FmtFrac(T.A[T.M, j]));
-                rowZ.Add(FmtFrac(T.A[T.M, cols - 1]));
-                sb.AppendLine($"{zLabel}\t" + string.Join("\t", rowZ));
+                // --- z row ON TOP ---
+                var zrow = new List<string>();
+                for (int j = 0; j < cols; j++) zrow.Add(FmtFrac(T.A[T.M, j]));
+                sb.AppendLine(zLabel + "\t" + string.Join("\t", zrow));
+                if (showTheta && enterCol.HasValue)
+                {
+                    var thetaRow = new string[cols];
+                    for (int j = 0; j < cols; j++) thetaRow[j] = (j == enterCol.Value) ? "↑" : "";
+                    sb.AppendLine("     \t" + string.Join("\t", thetaRow));
+                }
 
+                // then constraint rows
                 for (int i = 0; i < T.M; i++)
                 {
                     var row = new List<string>();
-                    for (int j = 0; j < cols - 1; j++) row.Add(FmtFrac(T.A[i, j]));
-                    row.Add(FmtFrac(T.A[i, cols - 1]));
-
-                    string theta = "";
-                    if (showTheta && enterCol.HasValue)
+                    for (int j = 0; j < cols; j++)
                     {
-                        double aij = T.A[i, enterCol.Value];
-                        if (aij > 1e-12) theta = FmtFrac(T.A[i, cols - 1] / aij);
+                        double v = T.A[i, j];
+                        row.Add(FmtFrac(v));
                     }
-                    sb.AppendLine($"{i + 1}\t" + string.Join("\t", row) + (showTheta ? "\t" + theta : ""));
+                    string lead = VarName(T, T.Basis[i]);
+                    sb.AppendLine(lead.PadRight(3) + "\t" + string.Join("\t", row));
                 }
+
                 sb.AppendLine();
             }
 
@@ -248,39 +252,35 @@ namespace Solver.Engine.CuttingPlanes
                     for (int j = 0; j < cols - 1; j++)
                     {
                         double rc = T.A[T.M, j];
-                        if (rc < mostNeg - 1e-12) { mostNeg = rc; enter = j; }
+                        if (rc < mostNeg - Eps) { mostNeg = rc; enter = j; }
                     }
-                    if (enter == -1)
+                    if (enter == -1) // optimal
                     {
                         T.Z = T.A[T.M, cols - 1];
-                        var sb = new StringBuilder();
-                        PrintTable(ref T, n, $"T-{tableNo}*", "z", sb, showTheta: false);
-                        log.Add(sb.ToString()); tableNo++;
-                        return true; // optimal (all rc >= 0)
+                        var snap = new StringBuilder();
+                        PrintTable(ref T, n, $"Table {tableNo++} — Optimal (LP Relax)", "(z*)", snap, false);
+                        log.Add(snap.ToString());
+                        return true;
                     }
 
-                    var snap = new StringBuilder();
-                    PrintTable(ref T, n, (tableNo == 1 ? "T-i" : $"T-{tableNo}"), "z", snap, showTheta: true, enterCol: enter);
-                    log.Add(snap.ToString()); tableNo++;
-
-                    // Leaving by min-ratio
-                    int leave = -1; double minRatio = double.PositiveInfinity;
+                    // Ratio test (positive pivots only)
+                    int leave = -1; double bestTheta = double.PositiveInfinity;
                     for (int i = 0; i < T.M; i++)
                     {
-                        double aij = T.A[i, enter];
-                        if (aij > 1e-12)
+                        double a = T.A[i, enter];
+                        if (a > Eps)
                         {
-                            double ratio = T.A[i, cols - 1] / aij;
-                            if (ratio >= -1e-12 && ratio < minRatio - 1e-12) { minRatio = ratio; leave = i; }
+                            double theta = T.A[i, cols - 1] / a;
+                            if (theta < bestTheta - Eps) { bestTheta = theta; leave = i; }
                         }
                     }
-                    if (leave == -1)
-                    {
-                        log.Add("Unbounded in primal simplex.");
-                        return false;
-                    }
+                    if (leave == -1) { log.Add("Primal simplex: Unbounded."); return false; }
 
                     Pivot(ref T, leave, enter);
+
+                    var sb = new StringBuilder();
+                    PrintTable(ref T, n, $"Table {tableNo++} — Primal simplex (enter c{enter + 1}, leave r{leave + 1})", "(z)", sb, true, enter);
+                    log.Add(sb.ToString());
                 }
             }
 
@@ -292,87 +292,130 @@ namespace Solver.Engine.CuttingPlanes
                 {
                     if (++iter > maxIter) { log.Add("Dual simplex: iteration limit."); return false; }
 
-                    // Pick leaving row with most negative RHS
-                    int leave = -1; double mostNeg = 0.0;
+                    // choose most negative RHS (leaving row)
+                    int leave = -1; double mostNegRhs = -Eps;
                     for (int i = 0; i < T.M; i++)
                     {
                         double rhs = T.A[i, cols - 1];
-                        if (rhs < mostNeg - 1e-12) { mostNeg = rhs; leave = i; }
+                        if (rhs < mostNegRhs) { mostNegRhs = rhs; leave = i; }
                     }
                     if (leave == -1)
                     {
                         T.Z = T.A[T.M, cols - 1];
-                        var sb = new StringBuilder();
-                        PrintTable(ref T, n, $"T-{tableNo}*", "z", sb, showTheta: false);
-                        log.Add(sb.ToString()); tableNo++;
-                        return true; // primal feasible
+                        var snap = new StringBuilder();
+                        PrintTable(ref T, n, $"Table {tableNo++} — Dual simplex optimal", "(z*)", snap, false);
+                        log.Add(snap.ToString());
+                        return true;
                     }
 
-                    // Candidates: a_il < 0 with rc_j > 0; minimize rc_j / (-a_il)
-                    int enter = -1; double best = double.PositiveInfinity;
+                    // choose entering column by minimum ratio of |z_j|/|a_ij| for a_ij < 0 (classic dual rule)
+                    int enter = -1; double bestRatio = double.PositiveInfinity;
                     for (int j = 0; j < cols - 1; j++)
                     {
                         double a = T.A[leave, j];
-                        if (a < -1e-12)
+                        if (a < -Eps)
                         {
-                            double rc = T.A[T.M, j];
-                            if (rc > 1e-12)
-                            {
-                                double ratio = rc / (-a);
-                                if (ratio < best - 1e-12 || (Math.Abs(ratio - best) <= 1e-12 && j < enter))
-                                {
-                                    best = ratio; enter = j;
-                                }
-                            }
+                            double ratio = Math.Abs(T.A[T.M, j] / a);
+                            if (ratio < bestRatio - Eps) { bestRatio = ratio; enter = j; }
                         }
                     }
-
-                    // Bland-like fallback if all rc_j ≤ 0 but we still have a_il < 0
-                    if (enter == -1)
-                    {
-                        for (int j = 0; j < cols - 1; j++)
-                        {
-                            double a = T.A[leave, j];
-                            double rc = T.A[T.M, j];
-                            if (a < -1e-12 && Math.Abs(rc) <= 1e-12)
-                            {
-                                enter = j;
-                                break;
-                            }
-                        }
-                        if (enter == -1)
-                        {
-                            log.Add("Dual simplex: no valid entering column.");
-                            return false;
-                        }
-                    }
-
-                    var snap = new StringBuilder();
-                    PrintTable(ref T, n, $"T-{tableNo}", "z", snap, showTheta: true, enterCol: enter);
-                    log.Add(snap.ToString()); tableNo++;
+                    if (enter == -1) { log.Add("Dual simplex: infeasible (no entering col)."); return false; }
 
                     Pivot(ref T, leave, enter);
+
+                    var sb = new StringBuilder();
+                    PrintTable(ref T, n, $"Table {tableNo++} — Dual simplex (enter c{enter + 1}, leave r{leave + 1})", "(z)", sb, false);
+                    log.Add(sb.ToString());
                 }
             }
 
-            public static void Pivot(ref Tableau T, int row, int col)
+            /// <summary>
+            /// Add Gomory cut row:  -∑ f_j * col_j + s_new = -f0
+            /// where f_j = frac(a_ij) for all nonbasic columns j ≠ basic(row).
+            /// </summary>
+            public static void AddLeqCut(ref Tableau T, double[] fracAllCols, double f0)
+            {
+                int oldRows = T.M;                     // number of constraint rows
+                int oldSlack = T.Slack;
+                int oldColsNoRhs = T.N + oldSlack;     // index of last coeff column in OLD matrix
+                int newColsNoRhs = oldColsNoRhs + 1;   // we insert one new slack column
+                int newRhsCol = newColsNoRhs;        // RHS column index in the NEW matrix
+
+                var Anew = new double[oldRows + 2, newColsNoRhs + 1];
+
+                // Copy old rows (coeffs) and RHS into the new RHS column
+                for (int i = 0; i < oldRows; i++)
+                {
+                    for (int j = 0; j < oldColsNoRhs; j++)
+                        Anew[i, j] = T.A[i, j];
+                    Anew[i, newRhsCol] = T.A[i, oldColsNoRhs];
+                }
+
+                // New cut row
+                int r = oldRows;
+                for (int j = 0; j < oldColsNoRhs; j++)
+                    Anew[r, j] = -fracAllCols[j];
+                Anew[r, oldColsNoRhs] = 1.0;   // new slack
+                Anew[r, newRhsCol] = -f0;   // RHS
+
+                // z row
+                int oldZ = oldRows, newZ = oldRows + 1;
+                for (int j = 0; j < oldColsNoRhs; j++)
+                    Anew[newZ, j] = T.A[oldZ, j];
+                Anew[newZ, oldColsNoRhs] = 0.0;
+                Anew[newZ, newRhsCol] = T.A[oldZ, oldColsNoRhs];
+
+                // Commit
+                T.A = Anew;
+                T.M = oldRows + 1;
+                T.Slack = oldSlack + 1;
+
+                var bas = new int[T.M];
+                Array.Copy(T.Basis, bas, T.Basis.Length);
+                bas[T.M - 1] = T.N + T.Slack - 1;
+                T.Basis = bas;
+            }
+
+            public static (double[] fracAll, double rhsFrac) BuildGomoryCut(Tableau T, int row)
+            {
+                int colsNoRhs = T.N + T.Slack;
+                int basic = T.Basis[row];
+
+                var frac = new double[colsNoRhs];
+
+                for (int j = 0; j < colsNoRhs; j++)
+                {
+                    if (j == basic) { frac[j] = 0.0; continue; }
+                    double a = T.A[row, j];
+                    double fj = a - Math.Floor(a + Eps);
+                    if (fj < Eps || 1.0 - fj < Eps) fj = 0.0;
+                    frac[j] = fj;
+                }
+
+                double rhs = T.A[row, colsNoRhs];
+                double f0 = rhs - Math.Floor(rhs + Eps);
+                if (f0 < Eps || 1.0 - f0 < Eps) f0 = 0.0;
+
+                return (frac, f0);
+            }
+
+            public static void Pivot(ref Tableau T, int leave, int enter)
             {
                 int cols = T.N + T.Slack + 1;
-                double piv = T.A[row, col];
-                if (Math.Abs(piv) < 1e-14) throw new InvalidOperationException("Pivot too small.");
+                double piv = T.A[leave, enter];
+                if (Math.Abs(piv) < Eps) piv = Eps;
 
-                for (int j = 0; j < cols; j++) T.A[row, j] /= piv;
+                for (int j = 0; j < cols; j++) T.A[leave, j] /= piv;
 
                 for (int i = 0; i <= T.M; i++)
                 {
-                    if (i == row) continue;
-                    double f = T.A[i, col];
-                    if (Math.Abs(f) < 1e-14) continue;
-                    for (int j = 0; j < cols; j++)
-                        T.A[i, j] -= f * T.A[row, j];
+                    if (i == leave) continue;
+                    double mult = T.A[i, enter];
+                    if (Math.Abs(mult) < Eps) continue;
+                    for (int j = 0; j < cols; j++) T.A[i, j] -= mult * T.A[leave, j];
                 }
 
-                T.Basis[row] = col;
+                T.Basis[leave] = enter;
             }
 
             public static double[] ReadPrimalSolution(Tableau T, int n)
@@ -381,283 +424,171 @@ namespace Solver.Engine.CuttingPlanes
                 var x = new double[n];
                 for (int i = 0; i < T.M; i++)
                 {
-                    int col = T.Basis[i];
-                    if (col < n) x[col] = T.A[i, cols - 1];
+                    int bc = T.Basis[i];
+                    if (bc < n)
+                    {
+                        x[bc] = T.A[i, cols - 1];
+                    }
                 }
                 return x;
             }
 
-            /// <summary>
-            /// Choose a Gomory row:
-            /// 1) candidates = rows with fractional RHS;
-            /// 2) prefer those whose BASIC variable is a decision variable (xᵢ);
-            /// 3) among them, pick the one with RHS fraction closest to 0.5;
-            /// 4) tie-break: leftmost basic column.
-            /// If no decision candidate exists, fall back to slacks with the same rule.
-            /// </summary>
             public static int ChooseGomoryRowSmart(Tableau T, int n, out string reason)
             {
                 int cols = T.N + T.Slack + 1;
-                var cand = new List<(int row, int basicCol, bool isX, double frac, double dist)>();
+                int bestRow = -1; double bestDist = double.PositiveInfinity;
                 for (int i = 0; i < T.M; i++)
                 {
+                    int bc = T.Basis[i];
+                    if (bc >= n) continue;
+
                     double rhs = T.A[i, cols - 1];
-                    double f = Fraction.Frac(rhs);
-                    if (f > 1e-9)
+                    double f = rhs - Math.Floor(rhs + Eps);
+                    if (f < Eps || 1.0 - f < Eps) continue;
+
+                    double dist = Math.Abs(f - 0.5);
+                    if (dist < bestDist - Eps || (Math.Abs(dist - bestDist) <= Eps && i < bestRow))
                     {
-                        int bc = T.Basis[i];
-                        bool isX = bc < n;
-                        double d = Math.Abs(f - 0.5);
-                        cand.Add((i, bc, isX, f, d));
+                        bestDist = dist; bestRow = i;
                     }
                 }
 
-                if (cand.Count == 0) { reason = "no fractional RHS"; return -1; }
-
-                var xCands = cand.Where(t => t.isX).OrderBy(t => t.dist).ThenBy(t => t.basicCol).ToList();
-                var pool = xCands.Count > 0 ? xCands : cand.OrderBy(t => t.dist).ThenBy(t => t.basicCol).ToList();
-
-                if (xCands.Count == 1) reason = "only fraction for the decision variables";
-                else if (xCands.Count > 1)
+                if (bestRow >= 0)
                 {
-                    double d0 = xCands[0].dist;
-                    double d1 = xCands[1].dist;
-                    reason = (Math.Abs(d0 - d1) <= 1e-9)
-                        ? "both the same distance, so we chose the most left"
-                        : "decimal part is closer to 0.5";
-                }
-                else
-                {
-                    reason = "no decision variable had a fractional RHS (cutting on slack)";
+                    reason = "choose RHS fractional part closest to 0.5 (ties → lowest row)";
+                    return bestRow;
                 }
 
-                return pool[0].row;
+                for (int i = 0; i < T.M; i++)
+                {
+                    double rhs = T.A[i, cols - 1];
+                    double f = rhs - Math.Floor(rhs + Eps);
+                    if (f >= Eps && 1.0 - f >= Eps) { reason = "fallback: any fractional RHS"; return i; }
+                }
+
+                reason = "none";
+                return -1;
             }
 
-            /// <summary>
-            /// Build a Gomory cut using fractional parts of **all current columns**
-            /// (x and existing slacks), to match the spreadsheet appearance.
-            /// Returns (fracCoeffs[0..N+Slack-1], rhsFrac).
-            /// </summary>
-            public static (double[] FracCoeffsAllCols, double RhsFrac) BuildGomoryCut(Tableau T, int row)
+            // ───────────────────── formatting helpers (slide-style) ─────────────────────
+
+            private static string VarName(Tableau T, int j)
+                => j < T.N ? $"x{j + 1}" : $"s{j - T.N + 1}";
+
+            private static string Term(double coeff, string name, bool first)
             {
-                int totalColsNoRhs = T.N + T.Slack;
-                var frac = new double[totalColsNoRhs];
-                for (int j = 0; j < totalColsNoRhs; j++)
-                    frac[j] = Fraction.Frac(T.A[row, j]);
-                double f0 = Fraction.Frac(T.A[row, totalColsNoRhs]);
-                return (frac, f0);
+                if (Math.Abs(coeff) < Eps) return "";
+                string sign = first ? (coeff < 0 ? "-" : "") : (coeff < 0 ? " - " : " + ");
+                double abs = Math.Abs(coeff);
+                return $"{sign}{FmtFrac(abs)} {name}";
             }
 
-            // ===== FULL derivation =====
-            public static IEnumerable<string> DeriveCutStepsFull(Tableau T, int row, int n, string cutOn)
+            private static string TermsSum(IEnumerable<(double c, string name)> items)
             {
-                var lines = new List<string>();
-                int totalColsNoRhs = T.N + T.Slack;
-                int basic = T.Basis[row];
-                string basicName = basic < n ? $"x{basic + 1}" : $"s{basic - n + 1}";
-                double rhs = T.A[row, totalColsNoRhs];
-
-                // Which columns participate? those with fractional part ≠ 0
-                var cols = new List<int>();
-                for (int j = 0; j < totalColsNoRhs; j++)
-                {
-                    if (j == basic) continue;
-                    double f = Fraction.Frac(T.A[row, j]);
-                    if (f > 1e-12) cols.Add(j);
-                }
-
-                // 1) Basic row with RAW coefficients
-                var sb1 = new StringBuilder();
-                sb1.Append(basicName).Append('\t');
-                foreach (var j in cols)
-                {
-                    double a = T.A[row, j];
-                    string name = j < n ? $"x{j + 1}" : $"s{j - n + 1}";
-                    sb1.Append($"{(a >= 0 ? "+ " : "- ")}{FmtFrac(Math.Abs(a))}{name}\t");
-                }
-                sb1.Append("=\t").Append(FmtFrac(rhs));
-                lines.Add(sb1.ToString().TrimEnd());
-
-                // 2) Split integer + fractional pieces
-                var sb2 = new StringBuilder();
-                sb2.Append(basicName).Append('\t');
-                foreach (var j in cols)
-                {
-                    double a = T.A[row, j];
-                    int k = (int)Math.Floor(a);
-                    double f = a - k; if (f < Eps) f = 0;
-                    string name = j < n ? $"x{j + 1}" : $"s{j - n + 1}";
-                    sb2.Append($"{(k >= 0 ? "+ " : "- ")}{FmtFrac(Math.Abs(k))}{name}\t");
-                    if (f > 0) sb2.Append($"+ {FmtFrac(f)}{name}\t");
-                }
-                int K0 = (int)Math.Floor(rhs);
-                double F0 = rhs - K0; if (F0 < Eps) F0 = 0;
-                sb2.Append("=\t").Append(FmtFrac(K0)).Append(" + ").Append(FmtFrac(F0));
-                lines.Add(sb2.ToString().TrimEnd());
-
-                // 3) Move integers left; fractional to right
-                var sb3 = new StringBuilder();
-                sb3.Append(basicName).Append('\t');
-                foreach (var j in cols)
-                {
-                    double a = T.A[row, j];
-                    int k = (int)Math.Floor(a);
-                    string name = j < n ? $"x{j + 1}" : $"s{j - n + 1}";
-                    sb3.Append($"{(k >= 0 ? "+ " : "- ")}{FmtFrac(Math.Abs(k))}{name}\t");
-                }
-                sb3.Append($"- {FmtFrac(K0)}\t=\t");
+                var sb = new StringBuilder();
                 bool first = true;
-                if (F0 != 0) { sb3.Append(FmtFrac(F0)); first = false; }
-                foreach (var j in cols)
+                foreach (var (c, name) in items)
                 {
-                    double a = T.A[row, j];
-                    int k = (int)Math.Floor(a);
-                    double f = a - k; if (f < Eps) f = 0;
-                    if (f == 0) continue;
-                    string name = j < n ? $"x{j + 1}" : $"s{j - n + 1}";
-                    sb3.Append(first ? "" : " ");
-                    sb3.Append($"- {FmtFrac(f)}{name}");
+                    if (Math.Abs(c) < Eps) continue;
+                    sb.Append(Term(c, name, first));
                     first = false;
                 }
-                if (first) sb3.Append("0");
-                lines.Add(sb3.ToString());
-
-                // 4) <= 0 form
-                var sb4 = new StringBuilder();
-                sb4.Append($"+{FmtFrac(F0)}");
-                foreach (var j in cols)
-                {
-                    double a = T.A[row, j];
-                    int k = (int)Math.Floor(a);
-                    double f = a - k; if (f < Eps) f = 0;
-                    if (f == 0) continue;
-                    string name = j < n ? $"x{j + 1}" : $"s{j - n + 1}";
-                    sb4.Append($" - {FmtFrac(f)}{name}");
-                }
-                sb4.Append(" <= 0");
-                lines.Add(sb4.ToString());
-
-                // 5) final canonical inequality
-                var sb5 = new StringBuilder();
-                bool first2 = true;
-                foreach (var j in cols)
-                {
-                    double a = T.A[row, j];
-                    int k = (int)Math.Floor(a);
-                    double f = a - k; if (f < Eps) f = 0;
-                    if (f == 0) continue;
-                    string name = j < n ? $"x{j + 1}" : $"s{j - n + 1}";
-                    sb5.Append(first2 ? "" : " ");
-                    sb5.Append($"- {FmtFrac(f)}{name}");
-                    first2 = false;
-                }
-                if (first2) sb5.Append("0");
-                sb5.Append(" <= -").Append(FmtFrac(F0));
-                lines.Add(sb5.ToString());
-
-                return lines;
+                return sb.Length == 0 ? "0" : sb.ToString();
             }
 
-            /// <summary>
-            /// Add cut row: - frac(col) + s_new ≤ -f0 across ALL columns (x and slacks),
-            /// then objective row moved to the last again.
-            /// </summary>
-            public static void AddGomoryCut(ref Tableau T, (double[] FracCoeffsAllCols, double RhsFrac) cut)
+            public static IEnumerable<string> FormatGomoryDerivationLines(Tableau T, int row)
             {
-                int oldRows = T.M + 1;
-                int oldCols = T.N + T.Slack + 1; // incl RHS
+                int colsNoRhs = T.N + T.Slack;
+                int basic = T.Basis[row];
 
-                var A2 = new double[T.M + 2, T.N + T.Slack + 2]; // +1 slack col, +1 RHS
-                for (int i = 0; i < oldRows; i++)
-                    for (int j = 0; j < oldCols; j++)
-                        A2[i, j] = T.A[i, j];
+                var terms = new List<(double a, double k, double f, string name)>();
+                for (int j = 0; j < colsNoRhs; j++)
+                {
+                    if (j == basic) continue;
+                    double a = T.A[row, j];
+                    double fj = a - Math.Floor(a + Eps); if (fj < Eps || 1 - fj < Eps) fj = 0.0;
+                    double kj = a - fj;
+                    terms.Add((a, kj, fj, VarName(T, j)));
+                }
+                double rhs = T.A[row, colsNoRhs];
+                double f0 = rhs - Math.Floor(rhs + Eps); if (f0 < Eps || 1 - f0 < Eps) f0 = 0.0;
+                double k0 = rhs - f0;
 
-                int newSlackCol = T.N + T.Slack;
-                int r = T.M;
+                string basicName = VarName(T, basic);
 
-                // - fractional parts on all existing columns (x & slacks)
-                for (int j = 0; j < newSlackCol; j++)
-                    A2[r, j] = -cut.FracCoeffsAllCols[j];
+                var t1 = terms.Select(t => (t.a, t.name));
+                string L1 = $"{basicName} {TermsSum(t1.Select(x => (x.a, x.name)))} = {FmtFrac(rhs)}";
+                string L2 = $"{basicName} {TermsSum(terms.SelectMany(t => new[] { (t.k, t.name), (t.f, t.name) }))} = {FmtFrac(k0)} + {FmtFrac(f0)}";
+                var leftInts = terms.Select(t => (t.k, t.name));
+                var rightFracs = terms.Select(t => (-t.f, t.name));
+                string L3Lhs = $"{basicName} {TermsSum(leftInts)} - {FmtFrac(k0)}";
+                string L3Rhs = $"{TermsSum(rightFracs)} + {FmtFrac(f0)}";
+                string L3 = $"{L3Lhs} = {L3Rhs}";
 
-                // + s_new
-                A2[r, newSlackCol] = 1.0;
-                // RHS = -f0
-                A2[r, newSlackCol + 1] = -cut.RhsFrac;
+                return new[] { L1, L2, L3 };
+            }
 
-                // copy objective row down one
-                for (int j = 0; j < oldCols; j++)
-                    A2[T.M + 1, j] = T.A[T.M, j];
-                A2[T.M + 1, newSlackCol] = 0.0;
-                A2[T.M + 1, newSlackCol + 1] = T.A[T.M, oldCols - 1];
+            public static string FormatFinalInequality(Tableau T, int row, double[] fracAllCols, double f0)
+            {
+                int colsNoRhs = T.N + T.Slack;
+                var items = new List<(double c, string name)>();
+                for (int j = 0; j < colsNoRhs; j++)
+                {
+                    if (j == T.Basis[row]) continue;
+                    double f = fracAllCols[j];
+                    if (f < Eps) continue;
+                    items.Add((-f, VarName(T, j)));
+                }
 
-                var basis = new int[T.M + 1];
-                for (int i = 0; i < T.M; i++) basis[i] = T.Basis[i];
-                basis[T.M] = newSlackCol;
-
-                T.A = A2;
-                T.M = T.M + 1;
-                T.Slack = T.Slack + 1;
-                T.Basis = basis;
-                T.Z = T.A[T.M, T.N + T.Slack];
+                string lhs = TermsSum(items);
+                if (lhs == "0") lhs = "0";
+                lhs = lhs == "0" ? $"{FmtFrac(f0)}" : $"{lhs} + {FmtFrac(f0)}";
+                return $"{lhs} ≤ 0";
             }
         }
+    }
 
-        // Fraction helpers (pretty formatting like 2 1/4, 5/9, etc.)
-        private static class Fraction
+    /// <summary>
+    /// Mixed fraction formatting (like slides).
+    /// </summary>
+    internal static class Fraction
+    {
+        public static string FormatMixed(double v, double eps = 1e-9, int maxDen = 64)
         {
-            public static string FormatMixed(double x, int maxDen = 99)
+            if (double.IsNaN(v) || double.IsInfinity(v)) return v.ToString(CultureInfo.InvariantCulture);
+            if (Math.Abs(v) < eps) return "0";
+
+            int sign = v < 0 ? -1 : 1;
+            v = Math.Abs(v);
+
+            int whole = (int)Math.Floor(v + eps);
+            double frac = v - whole;
+            if (frac < eps) return (sign * whole).ToString();
+
+            (int num, int den) = ToFraction(frac, maxDen);
+            if (whole == 0) return $"{(sign < 0 ? "-" : "")}{num}/{den}";
+            return $"{(sign < 0 ? "-" : "")}{whole} {num}/{den}";
+        }
+
+        private static (int, int) ToFraction(double x, int maxDen = 64, double eps = 1e-9)
+        {
+            int h1 = 1, h0 = 0, k1 = 0, k0 = 1;
+            double b = x;
+            do
             {
-                double r = Math.Round(x);
-                if (Math.Abs(x - r) < 1e-9) return r.ToString("0", CultureInfo.InvariantCulture);
+                int a = (int)Math.Floor(b);
+                int h2 = a * h1 + h0;
+                int k2 = a * k1 + k0;
 
-                int sign = x < 0 ? -1 : 1;
-                x = Math.Abs(x);
-                int whole = (int)Math.Floor(x);
-                double frac = x - whole;
-                (int num, int den) = ToFraction(frac, maxDen);
-                if (whole == 0)
-                    return (sign < 0 ? "-" : "") + $"{num}/{den}";
-                else
-                    return (sign < 0 ? "-" : "") + $"{whole} {num}/{den}";
-            }
+                if (k2 > maxDen) break;
 
-            public static double Frac(double x)
-            {
-                double f = x - Math.Floor(x);
-                if (f < 0) f += 1.0;
-                if (f < 1e-12) f = 0.0;
-                if (1.0 - f < 1e-12) f = 0.0;
-                return f;
-            }
+                h0 = h1; h1 = h2; k0 = k1; k1 = k2;
+                double frac = b - a;
+                if (frac < eps) break;
+                b = 1.0 / frac;
+            } while (true);
 
-            private static (int, int) ToFraction(double x, int maxDen)
-            {
-                int sgn = x < 0 ? -1 : 1; x = Math.Abs(x);
-                int a0 = (int)Math.Floor(x);
-                double frac = x - a0;
-                if (frac < 1e-9) return (a0 * sgn, 1);
-
-                long h1 = 1, k1 = 0, h = a0, k = 1;
-                double f = frac;
-                for (int i = 0; i < 20; i++)
-                {
-                    if (Math.Abs(f) < 1e-12) break;
-                    int ai = (int)Math.Floor(1.0 / f);
-                    long h2 = h1; long k2 = k1; h1 = h; k1 = k;
-                    h = ai * h1 + h2; k = ai * k1 + k2;
-                    if (k > maxDen) break;
-                    f = 1.0 / f - ai;
-                }
-                int num = (int)(h - a0 * k);
-                int den = (int)k;
-                if (den == 0) return (a0 * sgn, 1);
-                if (num == 0) return (0, 1);
-                int g = Gcd(Math.Abs(num), Math.Abs(den));
-                return (num / g, den / g);
-            }
-
-            private static int Gcd(int a, int b) { while (b != 0) (a, b) = (b, a % b); return a; }
+            return (h1, k1 == 0 ? 1 : k1);
         }
     }
 }
