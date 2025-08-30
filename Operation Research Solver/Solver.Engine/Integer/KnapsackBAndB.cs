@@ -10,16 +10,19 @@ using CoreConstraint = Solver.Engine.Core.Constraint;
 namespace Solver.Engine.Integer
 {
     /// <summary>
-    /// 0-1 Knapsack with Branch & Bound (fractional upper bound) and neat tabular output.
-    /// If the model is not a pure knapsack (MAX + single "<=" capacity + all bin),
-    /// this solver automatically defers to your existing stack:
-    ///   - BranchAndBoundSimplexSolver (if any int/bin vars)
-    ///   - DualSimplexSolver for MIN
-    ///   - PrimalSimplexSolver for MAX continuous
+    /// 0-1 Knapsack — Branch & Bound "Knapsack Method" with:
+    /// - Sort by value/weight (desc), "Ratio Test" table
+    /// - Greedy fractional upper bound with full TRACE lines (xk = 1 / a/b, capacity updates)
+    /// - Branch on the FIRST FRACTIONAL item from the greedy fill
+    /// - Sub-problem blocks labeled: Sub-P 1, Sub-P 2, Sub-P 2.1, Sub-P 2.2, ...
+    /// - Candidate / Infeasible / Best Candidate annotations
+    ///
+    /// If the model is not a pure knapsack (MAX, 1 <= constraint, all BIN), this falls back
+    /// to your existing solvers automatically.
     /// </summary>
     public sealed class Knapsack01Solver : ISolver
     {
-        public string Name => "0-1 Knapsack (B&B, pretty output)";
+        public string Name => "0-1 Knapsack (B&B, knapsack method)";
 
         public SolverResult Solve(LpModel model)
         {
@@ -37,174 +40,308 @@ namespace Solver.Engine.Integer
             return SolveKnapsack(model, n, cap);
         }
 
-        // ---------- pure knapsack path ----------
+        // ────────────────────────────────────────────────────────────────────
+        // Pure knapsack path
+        // ────────────────────────────────────────────────────────────────────
 
-        private sealed record Item(int Index, double Value, double Weight, double Ratio);
+        private sealed record Item(int Rank /*0..n-1 by ratio*/, int Index /*original*/,
+                                   double Value, double Weight, double Ratio);
 
-        private sealed class Node
+        private sealed class TraceResult
         {
-            public int Id { get; }
-            public int? ParentId { get; }
-            public string Path { get; }
-            public int Level { get; }
-            public double Profit { get; }
-            public double Weight { get; }
-            public BitSet Picks { get; }
-            public BitSet Excluded { get; }
-            public double Bound { get; set; }
-            public string Note { get; set; } = "";
-
-            public Node(int id, int? parentId, string path, int level, double profit, double weight,
-                        BitSet picks, BitSet excluded)
-            {
-                Id = id; ParentId = parentId; Path = path;
-                Level = level; Profit = profit; Weight = weight;
-                Picks = picks; Excluded = excluded;
-            }
+            public double Bound;
+            public int? FractionalRank;            // rank k* to branch on (null if all integer)
+            public bool IsIntegerCandidate;        // true if greedy produced all 0/1
+            public bool[] GreedyTakes = Array.Empty<bool>(); // in Rank order
+            public List<string> Steps = new();     // lines: "x5 = 1 15-4=11", "x1 = 7/12 7-12"
+            public double CandidateValue;          // = Bound when IsIntegerCandidate
         }
 
-        private sealed class BitSet
+        private sealed class PathFixes
         {
-            private readonly ulong[] _w;
-            public int Length { get; }
-            public BitSet(int length) { Length = length; _w = new ulong[(length + 63) >> 6]; }
-            private BitSet(int length, ulong[] words) { Length = length; _w = words; }
-            public bool this[int i] => ((_w[i >> 6] >> (i & 63)) & 1UL) != 0UL;
-            public BitSet Set(int i)
+            // In Rank order
+            public bool[] Take;      // fixed 1's
+            public bool[] Forbid;    // fixed 0's
+            public PathFixes(int n)
             {
-                var w = (ulong[])_w.Clone();
-                w[i >> 6] |= (1UL << (i & 63));
-                return new BitSet(Length, w);
+                Take = new bool[n];
+                Forbid = new bool[n];
+            }
+            public PathFixes Clone()
+            {
+                var p = new PathFixes(Take.Length);
+                Array.Copy(Take, p.Take, Take.Length);
+                Array.Copy(Forbid, p.Forbid, Take.Length);
+                return p;
             }
         }
 
         private SolverResult SolveKnapsack(LpModel model, int n, CoreConstraint capacity)
         {
             var log = new List<string>();
+            double[] values = model.Variables.Select(v => v.ObjectiveCoeff).ToArray();
+            double[] weights = capacity.Coeffs.ToArray();
+            double C = capacity.Rhs;
 
-            var values = model.Variables.Select(v => v.ObjectiveCoeff).ToArray();
-            var weights = capacity.Coeffs.ToArray();
-            var C = capacity.Rhs;
-
+            // Order by ratio (desc)
             var items = Enumerable.Range(0, n)
-                .Select(i => new Item(
-                    Index: i,
-                    Value: values[i],
-                    Weight: weights[i],
-                    Ratio: (weights[i] <= 0 ? double.PositiveInfinity : values[i] / weights[i])
-                ))
+                .Select(i => new Item(0, i, values[i], weights[i],
+                    weights[i] <= 0 ? double.PositiveInfinity : values[i] / weights[i]))
                 .OrderByDescending(it => it.Ratio)
+                .ThenBy(it => it.Index)
                 .ToArray();
 
-            int[] posOf = new int[n];
-            for (int rank = 0; rank < n; rank++) posOf[items[rank].Index] = rank;
-
-            // Header similar to your sheets, but tighter and aligned
-            var hdr = new StringBuilder();
-            hdr.AppendLine("═══════════════════════════════════════════════════════════════════════");
-            hdr.AppendLine("  Branch & Bound — Knapsack Method (Fractional UB)");
-            hdr.AppendLine($"  Items: n={n}    Capacity: C={Fmt(C)}");
-            hdr.AppendLine("  Order by value/weight (desc):");
             for (int k = 0; k < n; k++)
-                hdr.AppendLine($"    k={k:00}  →  x{items[k].Index + 1}   v={Fmt(items[k].Value),6}   w={Fmt(items[k].Weight),6}   r={Fmt(items[k].Ratio),8}");
-            hdr.AppendLine("═══════════════════════════════════════════════════════════════════════");
-            log.Add(hdr.ToString());
+                items[k] = items[k] with { Rank = k };
 
-            int nextId = 1;
-            var root = new Node(id: 0, parentId: null, path: "root", level: 0,
-                                profit: 0, weight: 0,
-                                picks: new BitSet(n), excluded: new BitSet(n));
-            root.Bound = FractionalBound(root, items, C);
-
-            var stack = new Stack<Node>();
-            stack.Push(root);
-
-            double zStar = 0.0;
-            var best = new BitSet(n);
-
-            var table = new StringBuilder();
-            table.AppendLine(TableHeader());
-            int visited = 0;
-
-            while (stack.Count > 0)
+            // Ratio Test block
+            var intro = new StringBuilder();
+            intro.AppendLine("═══════════════════════════════════════════════════════════════════════");
+            intro.AppendLine("Branch & Bound Algorithm — Knapsack method (fractional UB)");
+            intro.AppendLine($"Capacity C = {Fmt(C)}    Items n = {n}");
+            intro.AppendLine();
+            intro.AppendLine("Ratio Test");
+            intro.AppendLine("Item     v_i     w_i       v_i/w_i    Rank");
+            for (int k = 0; k < n; k++)
             {
-                var node = stack.Pop();
-                visited++;
-
-                if (node.Weight > C + 1e-12)
-                {
-                    table.AppendLine(TableRow(node, C, "PRUNE", "capacity"));
-                    continue;
-                }
-                if (node.Bound <= zStar + 1e-9)
-                {
-                    table.AppendLine(TableRow(node, C, "PRUNE", "bound"));
-                    continue;
-                }
-
-                if (node.Level == n)
-                {
-                    if (node.Profit > zStar + 1e-9)
-                    {
-                        zStar = node.Profit;
-                        best = node.Picks;
-                        table.AppendLine(TableRow(node, C, "LEAF*", "incumbent"));
-                    }
-                    else
-                    {
-                        table.AppendLine(TableRow(node, C, "LEAF", ""));
-                    }
-                    continue;
-                }
-
-                int k = node.Level;
                 var it = items[k];
+                intro.AppendLine($"x{it.Index + 1,-3} {Fmt(it.Value),8} {Fmt(it.Weight),8} {Fmt(it.Ratio),12} {k + 1,5}");
+            }
+            intro.AppendLine("═══════════════════════════════════════════════════════════════════════");
+            log.Add(intro.ToString());
 
-                // Exclude (right)
-                var ex = new Node(id: nextId++, parentId: node.Id, path: node.Path + ".R", level: k + 1,
-                                  profit: node.Profit, weight: node.Weight,
-                                  picks: node.Picks, excluded: node.Excluded.Set(k));
-                ex.Bound = FractionalBound(ex, items, C);
-                ex.Note = $"x{it.Index + 1}=0";
-                table.AppendLine(TableRow(ex, C, "→", "exclude"));
+            // Optional IP model block
+            var mdl = new StringBuilder();
+            mdl.AppendLine("Integer Programming Model");
+            var z = string.Join(" + ", Enumerable.Range(0, n).Select(i => $"{TrimZero(values[i])}x{i + 1}"));
+            var cstr = string.Join(" + ", Enumerable.Range(0, n).Select(i => $"{TrimZero(weights[i])}x{i + 1}"));
+            mdl.AppendLine($"max z = {z}");
+            mdl.AppendLine($"s.t. {cstr} ≤ {Fmt(C)}");
+            mdl.AppendLine("x_i ∈ {0,1}");
+            mdl.AppendLine();
+            log.Add(mdl.ToString());
 
-                // Include (left)
-                var inW = node.Weight + it.Weight;
-                var inP = node.Profit + it.Value;
-                var inc = new Node(id: nextId++, parentId: node.Id, path: node.Path + ".L", level: k + 1,
-                                   profit: inP, weight: inW,
-                                   picks: node.Picks.Set(k), excluded: node.Excluded);
-                inc.Bound = FractionalBound(inc, items, C);
-                inc.Note = $"x{it.Index + 1}=1";
-                table.AppendLine(TableRow(inc, C, "→", "include"));
+            // Global incumbent
+            double bestVal = 0.0;
+            bool[] bestX_byIndex = new bool[n];
 
-                // DFS: include first helps tighten z* earlier
-                stack.Push(ex);
-                stack.Push(inc);
+            // Run a throwaway trace on the root to find first fractional item
+            var rootFix = new PathFixes(n);
+            var throwaway = new List<string>();
+            ExploreSubProblem("Sub-P 1/2 setup", rootFix, items, C, values, weights,
+                              throwaway, out _, traceOnly: true, allowRecursion: false,
+                              ref bestVal, ref bestX_byIndex);
+            int? rootFrac = LastTrace?.FractionalRank ?? 0;
+
+            // Headline section
+            log.Add("Branch & Bound — Sub-Problems");
+
+            // Sub-P 1: set that item = 0
+            var fixes1 = rootFix.Clone();
+            fixes1.Forbid[rootFrac.Value] = true;
+            ExploreSubProblem("Sub-P 1", fixes1, items, C, values, weights, log,
+                              out var sub1Cand, traceOnly: false, allowRecursion: false,
+                              ref bestVal, ref bestX_byIndex);
+            if (sub1Cand.Value > bestVal)
+            {
+                bestVal = sub1Cand.Value;
+                bestX_byIndex = ToXByIndex(sub1Cand.Takes, items, n);
             }
 
-            table.AppendLine("───────────────────────────────────────────────────────────────────────");
-            table.AppendLine($"Visited nodes: {visited}");
-            log.Add(table.ToString());
+            // Sub-P 2: set that item = 1 (and allow deeper recursion)
+            var fixes2 = rootFix.Clone();
+            fixes2.Take[rootFrac.Value] = true;
+            ExploreSubProblem("Sub-P 2", fixes2, items, C, values, weights, log,
+                              out var sub2Cand, traceOnly: false, allowRecursion: true,
+                              ref bestVal, ref bestX_byIndex);
+            if (sub2Cand.Value > bestVal)
+            {
+                bestVal = sub2Cand.Value;
+                bestX_byIndex = ToXByIndex(sub2Cand.Takes, items, n);
+            }
 
-            var x = new double[n];
-            for (int k = 0; k < n; k++)
-                if (best[k]) x[items[k].Index] = 1.0;
-
-            var totalW = Dot(weights, x);
-            var totalV = Dot(values, x);
-
+            // Final solution print
             var sol = new StringBuilder();
-            sol.AppendLine("=== Solution ===");
-            for (int i = 0; i < n; i++) sol.AppendLine($"x{i + 1} = {(x[i] > 0.5 ? 1 : 0)}");
-            sol.AppendLine($"Total value (objective) = {Fmt(totalV)}");
-            sol.AppendLine($"Total weight = {Fmt(totalW)} (capacity {Fmt(C)})");
+            sol.AppendLine("Best Candidate");
+            sol.AppendLine($"z = {Fmt(bestVal)}");
+            for (int i = 0; i < n; i++) sol.AppendLine($"x{i + 1} = {(bestX_byIndex[i] ? 1 : 0)}");
             log.Add(sol.ToString());
 
-            return new SolverResult(true, totalV, x, log);
+            var x = bestX_byIndex.Select(b => b ? 1.0 : 0.0).ToArray();
+            return new SolverResult(true, bestVal, x, log);
         }
 
-        // ---------- helpers ----------
+        // We cache the last bound trace so we can know the first fractional item at the root
+        private TraceResult? LastTrace;
+
+        /// <summary>
+        /// Explore one sub-problem block:
+        /// - prints "*" for fixed decisions and shows capacity updates
+        /// - runs greedy UB with trace lines
+        /// - if integer candidate → prints Candidate
+        /// - else branches on the FIRST FRACTIONAL item from the trace:
+        ///      child ".1" sets it = 0 ; child ".2" sets it = 1
+        /// Updates incumbent (bestVal / bestX_byIndex) via ref.
+        /// </summary>
+        private void ExploreSubProblem(
+            string label,
+            PathFixes fixes,
+            Item[] items, double C,
+            double[] values, double[] weights,
+            IList<string> logBlock,
+            out (double Value, bool[] Takes) candidate,
+            bool traceOnly,
+            bool allowRecursion,
+            ref double bestVal,
+            ref bool[] bestX_byIndex)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine(label);
+            double rem0 = C;
+
+            // Show starred/fixed decisions like slides
+            for (int k = 0; k < items.Length; k++)
+            {
+                var it = items[k];
+                if (fixes.Take[k])
+                {
+                    double before = rem0;
+                    rem0 -= it.Weight;
+                    sb.AppendLine($"* x{it.Index + 1} = 1 {FmtInt(before)}-{FmtInt(it.Weight)}={FmtInt(rem0)}");
+                }
+                if (fixes.Forbid[k])
+                {
+                    double before = rem0;
+                    sb.AppendLine($"* x{it.Index + 1} = 0 {FmtInt(before)}-0={FmtInt(rem0)}");
+                }
+            }
+
+            // Infeasible immediately?
+            double fixedW = 0.0, fixedV = 0.0;
+            for (int k = 0; k < items.Length; k++)
+            {
+                if (fixes.Take[k]) { fixedW += items[k].Weight; fixedV += items[k].Value; }
+            }
+            if (fixedW > C + 1e-9)
+            {
+                sb.AppendLine("Infeasible");
+                logBlock.Add(sb.ToString());
+                candidate = (0.0, new bool[items.Length]);
+                LastTrace = null;
+                return;
+            }
+
+            // Greedy UB with trace
+            var tr = FractionalBoundWithTrace(items, C, fixes);
+            LastTrace = tr;
+
+            foreach (var line in tr.Steps) sb.AppendLine(line);
+
+            if (tr.IsIntegerCandidate)
+            {
+                sb.AppendLine($"z = {Fmt(tr.CandidateValue)} ");
+                sb.AppendLine("Candidate");
+                logBlock.Add(sb.ToString());
+                candidate = (tr.CandidateValue, tr.GreedyTakes.ToArray());
+                return;
+            }
+
+            // Not integer → show split
+            candidate = (0.0, tr.GreedyTakes);
+            if (traceOnly)
+            {
+                logBlock.Add(sb.ToString());
+                return;
+            }
+
+            int kStar = tr.FractionalRank!.Value;
+
+            // First child: fractional item = 0
+            var f1 = fixes.Clone();
+            f1.Forbid[kStar] = true;
+            ExploreSubProblem(label + ".1", f1, items, C, values, weights, logBlock,
+                              out var cand1, traceOnly: false, allowRecursion: allowRecursion,
+                              ref bestVal, ref bestX_byIndex);
+            if (cand1.Value > bestVal)
+            {
+                bestVal = cand1.Value;
+                bestX_byIndex = ToXByIndex(cand1.Takes, items, values.Length);
+            }
+
+            // Second child: fractional item = 1
+            var f2 = fixes.Clone();
+            f2.Take[kStar] = true;
+            ExploreSubProblem(label + ".2", f2, items, C, values, weights, logBlock,
+                              out var cand2, traceOnly: false, allowRecursion: allowRecursion,
+                              ref bestVal, ref bestX_byIndex);
+            if (cand2.Value > bestVal)
+            {
+                bestVal = cand2.Value;
+                bestX_byIndex = ToXByIndex(cand2.Takes, items, values.Length);
+            }
+
+            // Append this block at the end (after either candidate or branching)
+            // (We already appended the lines above; keeping for symmetry.)
+            // logBlock.Add(sb.ToString()); // optional
+        }
+
+        private TraceResult FractionalBoundWithTrace(Item[] items, double C, PathFixes fixes)
+        {
+            var tr = new TraceResult
+            {
+                GreedyTakes = new bool[items.Length]
+            };
+
+            double w = 0.0, z = 0.0;
+
+            // start from fixed takes
+            for (int k = 0; k < items.Length; k++)
+            {
+                if (fixes.Take[k])
+                {
+                    w += items[k].Weight;
+                    z += items[k].Value;
+                    tr.GreedyTakes[k] = true;
+                }
+            }
+
+            double rem = C - w;
+
+            // Greedy over remaining (skip fixed/forbidden)
+            for (int k = 0; k < items.Length; k++)
+            {
+                if (fixes.Take[k] || fixes.Forbid[k]) continue;
+                if (rem <= 1e-12) break;
+
+                var it = items[k];
+                if (it.Weight <= rem + 1e-12)
+                {
+                    // take fully
+                    double before = rem;
+                    z += it.Value;
+                    rem -= it.Weight;
+                    w += it.Weight;
+                    tr.GreedyTakes[k] = true;
+                    tr.Steps.Add($"x{it.Index + 1} = 1 {FmtInt(before)}-{FmtInt(it.Weight)}={FmtInt(rem)}");
+                }
+                else
+                {
+                    // fractional
+                    double before = rem;
+                    double frac = rem / it.Weight;
+                    z += it.Value * frac;
+                    tr.FractionalRank = k;
+                    tr.Steps.Add($"x{it.Index + 1} = {FmtFrac(rem, it.Weight)} {FmtInt(before)}-{FmtInt(it.Weight)}");
+                    rem = 0.0;
+                    break;
+                }
+            }
+
+            tr.Bound = z;
+            tr.IsIntegerCandidate = !tr.FractionalRank.HasValue;
+            if (tr.IsIntegerCandidate) tr.CandidateValue = z;
+            return tr;
+        }
 
         private static bool IsPureKnapsack(LpModel model, out int n, out CoreConstraint capacity)
         {
@@ -222,74 +359,51 @@ namespace Solver.Engine.Integer
             return true;
         }
 
-        private static string TableHeader()
+        // ────────────────────────────────────────────────────────────────────
+        // Utilities / formatting
+        // ────────────────────────────────────────────────────────────────────
+
+        private static string Fmt(double x) => x.ToString("0.####", CultureInfo.InvariantCulture);
+
+        private static string TrimZero(double x)
         {
-            return
-                "Node  Parent  Path         Lvl  Next  Decision   Profit      Weight    RemCap     Bound    Status (why)\n" +
-                "----- ------- ------------ ---- ----- ---------- ---------- ---------- ---------- ---------- ----------------";
-        }
-
-        private static string TableRow(Node n, double capacity, string status, string why)
-        {
-            string next = n.Level.ToString(CultureInfo.InvariantCulture).PadLeft(2);
-            string parent = n.ParentId?.ToString() ?? "-";
-            string dec = string.IsNullOrEmpty(n.Note) ? "-" : n.Note;
-            string rem = Fmt(Math.Max(0.0, capacity - n.Weight));
-
-            return string.Format(CultureInfo.InvariantCulture,
-                "{0,-5} {1,-7} {2,-12} {3,4}  {4,2}    {5,-10} {6,10} {7,10} {8,10} {9,10} {10} {11}",
-                n.Id,
-                parent,
-                (n.Path.Length > 12 ? n.Path[^12..] : n.Path),
-                n.Level,
-                next,
-                dec,
-                Fmt(n.Profit),
-                Fmt(n.Weight),
-                rem,
-                Fmt(n.Bound),
-                status,
-                (string.IsNullOrEmpty(why) ? "" : $"({why})")
-            );
-        }
-
-        private static double FractionalBound(Node node, Item[] items, double C)
-        {
-            double profit = node.Profit;
-            double weight = node.Weight;
-
-            for (int k = node.Level; k < items.Length; k++)
-            {
-                if (node.Excluded[k]) continue;
-                var it = items[k];
-                if (weight >= C) break;
-
-                if (weight + it.Weight <= C)
-                {
-                    weight += it.Weight;
-                    profit += it.Value;
-                }
-                else
-                {
-                    double remain = C - weight;
-                    if (remain > 1e-12 && it.Weight > 0)
-                    {
-                        profit += it.Value * (remain / it.Weight);
-                        weight = C;
-                    }
-                    break;
-                }
-            }
-            return profit;
-        }
-
-        private static double Dot(double[] a, double[] b)
-        {
-            double s = 0.0;
-            for (int i = 0; i < a.Length; i++) s += a[i] * b[i];
+            var s = x.ToString("0.####", CultureInfo.InvariantCulture);
+            if (s == "-0") s = "0";
             return s;
         }
 
-        private static string Fmt(double x) => x.ToString("0.####", CultureInfo.InvariantCulture);
+        // integer-looking format for capacities/weights in the trace
+        private static string FmtInt(double x)
+        {
+            double r = Math.Round(x);
+            return Math.Abs(x - r) < 1e-9 ? ((long)r).ToString(CultureInfo.InvariantCulture) : Fmt(x);
+        }
+
+        private static string FmtFrac(double num, double den)
+        {
+            // If both are (near) integers, print as a/b; else decimal
+            double nRound = Math.Round(num), dRound = Math.Round(den);
+            if (Math.Abs(num - nRound) < 1e-9 && Math.Abs(den - dRound) < 1e-9 && dRound != 0.0)
+            {
+                long a = (long)nRound, b = (long)dRound;
+                long g = Gcd(Math.Abs(a), Math.Abs(b));
+                return $"{a / g}/{b / g}";
+            }
+            return Fmt(num / den);
+        }
+
+        private static long Gcd(long a, long b)
+        {
+            while (b != 0) { long t = a % b; a = b; b = t; }
+            return a == 0 ? 1 : Math.Abs(a);
+        }
+
+        private static bool[] ToXByIndex(bool[] takesByRank, Item[] items, int n)
+        {
+            var x = new bool[n];
+            for (int k = 0; k < items.Length; k++)
+                if (takesByRank[k]) x[items[k].Index] = true;
+            return x;
+        }
     }
 }
