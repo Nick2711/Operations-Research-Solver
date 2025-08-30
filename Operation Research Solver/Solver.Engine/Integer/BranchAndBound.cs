@@ -9,12 +9,11 @@ using Solver.Engine.Simplex;
 namespace Solver.Engine.Integer
 {
     /// <summary>
-    /// Branch & Bound (Tableau) prototype for step-by-step build:
-    /// 1) Solve LP relaxation with PRIMAL simplex; print only the optimal tableau (decimals).
-    /// 2) Find rows with fractional RHS whose BASIC var is a decision x_j.
-    /// 3) Create two subproblems (structure only) and
-    /// 4) Re-opt each child with DUAL SIMPLEX (logs + final tableaus).
-    /// Then recurse depth-first on the dual-optimal children until all basic x rows are integral.
+    /// Branch & Bound (Tableau)
+    /// - Adds x_j <= 1 caps for BIN variables at the root so every node inherits them (fallback: assume all x are BIN if none flagged).
+    /// - Branching on binaries uses x_j <= 0 and x_j >= 1 split.
+    /// - Dual Simplex re-optimization after each branch row is added.
+    /// - Candidate extraction uses the basis map; we also verify z == c·x before accepting incumbents.
     /// </summary>
     public sealed class BranchAndBoundSimplexSolver : ISolver
     {
@@ -31,9 +30,25 @@ namespace Solver.Engine.Integer
             log.Add("ok B&B algorithm");
             log.Add("Optimal table from relaxed primal");
 
-            // ---------- root primal (unchanged) ----------
-            var T = BuildPhaseIIFromModel(model);
-            var basis = Enumerable.Range(model.NumVars, model.NumConstraints).ToArray();
+            int numX = model.NumVars;
+
+            // Detect binary vars; fallback to "all binary" if none are flagged.
+            bool[] isBin = model.Variables.Select(v => v.Sign == SignRestriction.Bin).ToArray();
+            int flagged = isBin.Count(b => b);
+            if (flagged == 0)
+            {
+                isBin = Enumerable.Repeat(true, numX).ToArray();
+                log.Add($"[root] No variables flagged BIN → assuming all {numX} decision vars are binary and adding x<=1 caps.");
+            }
+            else
+            {
+                log.Add($"[root] Detected {flagged} binary variables → adding x<=1 caps for those vars.");
+            }
+
+            // ---------- root primal (with x<=1 for chosen vars) ----------
+            var T = BuildPhaseIIFromModel(model, isBin, log); // includes bin-cap rows
+            var basis = Enumerable.Range(numX, Constraints(T)).ToArray();
+
             var root = PrimalOptimizeToOptimal(T, basis);
             if (!root.success)
             {
@@ -41,31 +56,46 @@ namespace Solver.Engine.Integer
                 return new SolverResult(false, 0, Array.Empty<double>(), log, infeasible: root.infeasible);
             }
 
-            PrintTable("═══════════════════════════════════════════════════════════════════════\nOptimal LP tableau", T, basis, model.NumVars, log);
+            PrintTable("═══════════════════════════════════════════════════════════════════════\nOptimal LP tableau", T, basis, numX, log);
             log.Add($"Objective (z) = {Fmt(T[0, T.GetLength(1) - 1])}");
             log.Add("");
 
-            var firstCand = FindFractionalBasicXRows(T, basis, model.NumVars);
+            var firstCand = FindFractionalBasicXRows(T, basis, numX);
             log.Add("Branch & Bound — fractional basic x rows");
             log.Add("row\tbasic\tvalue\tfrac");
             foreach (var r in firstCand) log.Add($"{r.rowIndex}\t{xName(r.basicJ)}\t{Fmt(r.value)}\t{Fmt(r.frac)}");
             log.Add("");
 
-            // ---------- full DFS, NO bound-pruning ----------
+            // ---------- full DFS (no bounding cuts here; simple demo) ----------
             bool haveIncumbent = false;
             double incumbentZ = double.NegativeInfinity;
             double[] incumbentX = Array.Empty<double>();
             int visited = 0;
 
+            double ObjFromX(double[] x)
+            {
+                double s = 0.0;
+                for (int j = 0; j < numX; j++) s += model.Variables[j].ObjectiveCoeff * x[j];
+                return s;
+            }
+
             void ConsiderCandidate(string label, double[,] Tn, int[] Bn)
             {
-                double zn = Tn[0, ColsNoRhs(Tn)];
-                var xn = ExtractX(Tn, Bn, model.NumVars);
-                if (!haveIncumbent || zn > incumbentZ + 1e-12)
+                int n = ColsNoRhs(Tn);
+                double z_tab = Tn[0, n];
+                var xn = ExtractX(Tn, Bn, numX);
+                double z_x = ObjFromX(xn);
+
+                if (Math.Abs(z_x - z_tab) > 1e-6)
+                    log.Add($"[warn] objective mismatch at {label}: tableau z={Fmt(z_tab)} vs c·x={Fmt(z_x)} — using c·x");
+
+                double zcand = z_x;
+
+                if (!haveIncumbent || zcand > incumbentZ + 1e-12)
                 {
-                    haveIncumbent = true; incumbentZ = zn; incumbentX = xn;
-                    log.Add($"Candidate at {label}: all basic x RHS integral, z = {Fmt(zn)}");
-                    PrintTable("Optimal tableau (candidate)", Tn, Bn, model.NumVars, log);
+                    haveIncumbent = true; incumbentZ = zcand; incumbentX = xn;
+                    log.Add($"Candidate at {label}: all basic x RHS integral, z = {Fmt(zcand)}");
+                    PrintTable("Optimal tableau (candidate)", Tn, Bn, numX, log);
                 }
             }
 
@@ -73,18 +103,15 @@ namespace Solver.Engine.Integer
             {
                 if (++visited > MAX_NODES) { log.Add("Node limit reached; stopping search."); return; }
 
-                // stop this branch when integer-feasible (candidate)
-                if (IsIntegerBasicXRows(Tnode, Bnode, model.NumVars))
+                if (IsIntegerBasicXRows(Tnode, Bnode, numX))
                 {
                     ConsiderCandidate(label, Tnode, Bnode);
                     return;
                 }
 
-                // choose fractional basic x row
-                var cands = FindFractionalBasicXRows(Tnode, Bnode, model.NumVars);
+                var cands = FindFractionalBasicXRows(Tnode, Bnode, numX);
                 if (cands.Count == 0)
                 {
-                    // rare: nothing to branch on, treat as candidate
                     ConsiderCandidate(label + " (no branchable rows)", Tnode, Bnode);
                     return;
                 }
@@ -96,50 +123,51 @@ namespace Solver.Engine.Integer
 
                 log.Add($"Branch at {label}: row {r0 + 1}, {xName(j)} = {Fmt(b)} (frac {Fmt(frac)})");
 
-                // child 1: x_j ≤ floor(b)
+                // If binary, force 0/1 split. Otherwise, generic floor/ceil.
+                bool treatAsBinary = isBin[j];
+                double upperForLeft = treatAsBinary ? 0.0 : Math.Floor(b + 1e-12);
+                double lowerForRight = treatAsBinary ? 1.0 : Math.Ceiling(b - 1e-12);
+
+                // child 1: x_j ≤ upper
                 {
-                    double U = Math.Floor(b + 1e-12);
                     var child = AddBranchConstraintExact(
                         parentT: Tnode, parentBasis: Bnode,
                         branchRowOneBased: r0 + 1,
-                        varCol: j, isUpper: true, bound: U,
-                        log: log, subLabel: $"{label}.1: {xName(j)} ≤ {Fmt(U)} (add slack)"
+                        varCol: j, isUpper: true, bound: upperForLeft,
+                        log: log, subLabel: $"{label}.1: {xName(j)} ≤ {Fmt(upperForLeft)} (add slack)"
                     );
 
                     log.Add($"{label}.1 — Dual Simplex re-optimization");
-                    var dual = DualOptimizeWithLogs(child.T, child.Basis, model.NumVars, log);
+                    var dual = DualOptimizeWithLogs(child.T, child.Basis, numX, log);
                     if (!dual.success)
                     {
                         log.Add(dual.infeasible ? $"{label}.1: infeasible → prune." : $"{label}.1: dual stalled → prune.");
                     }
                     else
                     {
-                        PrintTable($"{label}.1 — Dual simplex optimal tableau", child.T, child.Basis, model.NumVars, log);
-                        // **no bound pruning** → always explore feasible child
+                        PrintTable($"{label}.1 — Dual simplex optimal tableau", child.T, child.Basis, numX, log);
                         Explore(child.T, child.Basis, label + ".1");
                     }
                 }
 
-                // child 2: x_j ≥ ceil(b)
+                // child 2: x_j ≥ lower
                 {
-                    double Lb = Math.Ceiling(b - 1e-12);
                     var child = AddBranchConstraintExact(
                         parentT: Tnode, parentBasis: Bnode,
                         branchRowOneBased: r0 + 1,
-                        varCol: j, isUpper: false, bound: Lb,
-                        log: log, subLabel: $"{label}.2: {xName(j)} ≥ {Fmt(Lb)} (add excess)"
+                        varCol: j, isUpper: false, bound: lowerForRight,
+                        log: log, subLabel: $"{label}.2: {xName(j)} ≥ {Fmt(lowerForRight)} (add excess)"
                     );
 
                     log.Add($"{label}.2 — Dual Simplex re-optimization");
-                    var dual = DualOptimizeWithLogs(child.T, child.Basis, model.NumVars, log);
+                    var dual = DualOptimizeWithLogs(child.T, child.Basis, numX, log);
                     if (!dual.success)
                     {
                         log.Add(dual.infeasible ? $"{label}.2: infeasible → prune." : $"{label}.2: dual stalled → prune.");
                     }
                     else
                     {
-                        PrintTable($"{label}.2 — Dual simplex optimal tableau", child.T, child.Basis, model.NumVars, log);
-                        // **no bound pruning** → always explore feasible child
+                        PrintTable($"{label}.2 — Dual simplex optimal tableau", child.T, child.Basis, numX, log);
                         Explore(child.T, child.Basis, label + ".2");
                     }
                 }
@@ -149,8 +177,8 @@ namespace Solver.Engine.Integer
 
             if (!haveIncumbent)
             {
-                var xrel = ExtractX(T, basis, model.NumVars);
-                var zrel = T[0, T.GetLength(1) - 1];
+                var xrel = ExtractX(T, basis, numX);
+                var zrel = model.Variables.Select(v => v.ObjectiveCoeff).Zip(xrel).Sum(t => t.First * t.Second);
                 log.Add("\nFinished without integer incumbent — returning relaxed solution.");
                 log.Add($"SUCCESS — Objective: {Fmt(zrel)}");
                 log.Add($"Solution: {string.Join(", ", xrel.Select((v, i) => $"x{i + 1}={Fmt(v)}"))}");
@@ -165,12 +193,6 @@ namespace Solver.Engine.Integer
         // ───────────────────────── exact row-build helper (branch row − skeleton, flip if RHS>0) ─────────────────────────
         private sealed class ChildTableau { public double[,] T = default!; public int[] Basis = default!; }
 
-        /// <summary>
-        /// Build a child tableau by adding one branching constraint using:
-        /// newRow = (branchRow) − (skeleton), across ALL columns including RHS.
-        /// If RHS > 0, multiply the whole row by −1 so Dual Simplex can proceed.
-        /// New column’s reduced cost in z-row is 0; new row is basic at the new column.
-        /// </summary>
         private static ChildTableau AddBranchConstraintExact(
             double[,] parentT, int[] parentBasis,
             int branchRowOneBased, int varCol,
@@ -209,7 +231,7 @@ namespace Solver.Engine.Integer
             child[newRow, rhsC] = parentT[rOld, rhsP];
 
             log.Add(subLabel);
-            log.Add($"Branch row {branchRowOneBased} (copy)");
+            log.Add("Branch row (copy)");
             log.Add(RowToLine(child, newRow, newColsNoRhs, header: $"row {branchRowOneBased}"));
 
             // Build skeleton: x_j ± s_new = bound
@@ -225,21 +247,17 @@ namespace Solver.Engine.Integer
             for (int c = 0; c <= newColsNoRhs; c++)
                 child[newRow, c] -= skel[c];
 
-            log.Add($"row {branchRowOneBased} − skeleton (raw)");
+            log.Add("row − skeleton (raw)");
             log.Add(RowToLine(child, newRow, newColsNoRhs, header: "new row (pre-flip)"));
 
-            // If RHS > 0, flip entire row
+            // If RHS > 0, flip entire row to make dual feasible start (RHS ≤ 0)
             if (child[newRow, rhsC] > 1e-12)
             {
                 for (int c = 0; c <= newColsNoRhs; c++) child[newRow, c] = -child[newRow, c];
                 log.Add("RHS > 0 ⇒ multiply whole row by −1");
-                log.Add(RowToLine(child, newRow, newColsNoRhs, header: "new row"));
             }
-            else
-            {
-                log.Add("New constraint row (added):");
-                log.Add(RowToLine(child, newRow, newColsNoRhs, header: "new row"));
-            }
+
+            log.Add(RowToLine(child, newRow, newColsNoRhs, header: "new row"));
 
             // Keep reduced costs unchanged for the new column
             child[0, newCol] = 0.0;
@@ -370,26 +388,45 @@ namespace Solver.Engine.Integer
             log.Add(sb.ToString());
         }
 
-        private static void PrintTableInline(double[,] T, int[] basis, int numX, List<string> log)
-            => PrintTable("Tableau (structure + new constraint)", T, basis, numX, log);
-
-        // ───────────────────────── Step 1: Phase-II & primal optimum ─────────────────────────
-        private static double[,] BuildPhaseIIFromModel(LpModel model)
+        // ───────────────────────── Phase-II & primal optimum ─────────────────────────
+        /// <summary>
+        /// Builds Phase-II tableau A|I|b for MAX with <= rows.
+        /// Additionally appends one <= row for each j with isBin[j] == true: x_j <= 1 (with its own slack).
+        /// </summary>
+        private static double[,] BuildPhaseIIFromModel(LpModel model, bool[] isBin, List<string> log)
         {
-            int m = model.NumConstraints;
-            int p = model.NumVars;
-            int n = p + m;
-            var T = new double[m + 1, n + 1];
+            int m0 = model.NumConstraints;   // original constraints
+            int p = model.NumVars;          // decision vars
+            int add = isBin.Count(b => b);   // # of bin caps
+            int m = m0 + add;               // total rows
+            int n = p + m;                  // total columns before RHS
 
-            // A|I and b
-            for (int i = 0; i < m; i++)
+            var T = new double[m + 1, n + 1]; // +1 for z row, +1 for RHS
+
+            // Original rows: A|I and b
+            for (int i = 0; i < m0; i++)
             {
                 for (int j = 0; j < p; j++) T[i + 1, j] = model.Constraints[i].Coeffs[j];
                 T[i + 1, p + i] = 1.0;
                 T[i + 1, n] = model.Constraints[i].Rhs;
             }
+
+            // Extra rows: for each j with isBin[j], add (x_j <= 1) with its own slack
+            int extra = 0;
+            for (int j = 0; j < p; j++)
+            {
+                if (!isBin[j]) continue;
+                int r = m0 + extra;             // global row index (0-based)
+                T[r + 1, j] = 1.0;            // coeff on x_j
+                T[r + 1, p + r] = 1.0;          // its slack
+                T[r + 1, n] = 1.0;            // RHS = 1
+                extra++;
+            }
+            log.Add($"[root] Added {add} binary-cap rows (x_j ≤ 1). Total rows now: {m}.");
+
             // z = -c (MAX)
             for (int j = 0; j < p; j++) T[0, j] = -model.Variables[j].ObjectiveCoeff;
+
             return T;
         }
 
@@ -494,13 +531,22 @@ namespace Solver.Engine.Integer
         {
             int n = ColsNoRhs(T);
             var x = new double[numX];
-            for (int i = 0; i < basis.Length && i < numX; i++)
+
+            // IMPORTANT: scan ALL basis rows, not just the first numX
+            for (int i = 0; i < basis.Length; i++)
             {
                 int j = basis[i];
-                if (j >= 0 && j < numX) x[j] = T[i + 1, n];
+                if (j >= 0 && j < numX)
+                {
+                    double v = T[i + 1, n];
+                    // clean tiny numerical noise
+                    if (Math.Abs(v) < 1e-9) v = 0.0;
+                    x[j] = v;
+                }
             }
             return x;
         }
+
 
         private static double[,] Clone(double[,] T)
         {
