@@ -14,7 +14,7 @@ namespace Solver.Engine.Sensitivity
         public SensitivityAnalyzer(SensitivityPayload s)
         {
             _s = s;
-            _Binv = Matrix.Inverse(s.B);
+            //_Binv = Matrix.Inverse(s.B);
         }
 
         public Dictionary<int, double> ShadowPrices()
@@ -27,17 +27,6 @@ namespace Solver.Engine.Sensitivity
 
 
 
-        }
-
-        public Dictionary<int, double> ReducedCosts()
-        {
-            // rN = cN - cB^T B^{-1} N
-            var y = MulRowMat(_s.cB, _Binv);
-            var yN = MulRowMat(y, _s.N);
-            var dict = new Dictionary<int, double>();
-            for (int j = 0; j < _s.cN.Length; j++)
-                dict[_s.NonBasicIdx[j]] = _s.cN[j] - yN[j]; // key = original var index
-            return dict;
         }
 
         public List<(int constraint, double rhs, (double lo, double hi) range)> RhsRanges()

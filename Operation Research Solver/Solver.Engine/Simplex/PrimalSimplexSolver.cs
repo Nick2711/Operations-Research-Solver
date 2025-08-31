@@ -6,6 +6,7 @@ using Solver.Engine.IO;
 using Solver.Engine.Sensitivity;
 using static Solver.Engine.Core.Numeric;
 using static Solver.Engine.Simplex.TableauOps;
+using Solver.Engine.Utils;
 
 namespace Solver.Engine.Simplex
 {
@@ -41,7 +42,7 @@ namespace Solver.Engine.Simplex
                 can = phaseI.CanonPhaseII;
             }
 
-            // Phase II (regular)
+            // Phase II
             return RunPhaseII(model, can, log);
         }
 
@@ -49,7 +50,7 @@ namespace Solver.Engine.Simplex
         {
             int m = can.A.GetLength(0);
             int n = can.A.GetLength(1);
-            int p = model.NumVars;          // original decision count
+            int p = model.NumVars;
             int width = n + 1;
 
             var T = new double[m + 1, n + 1];
@@ -78,7 +79,7 @@ namespace Solver.Engine.Simplex
                 if (Math.Abs(cb) > EPS) AddScaledRow(T, 0, r + 1, cb, width);
             }
 
-            // Print canonical + initial tableau with accurate names
+            // Initial print
             log.Add(Printer.RenderCanonical(can.A, can.b, can.c, p, can.Map.ColumnNames, can.Map.RowNames));
             int enter = FindEntering(T, basicSet, n);
             var thetaDisp = ComputeThetaColumn(T, enter, m, n);
@@ -90,16 +91,14 @@ namespace Solver.Engine.Simplex
                 enter = FindEntering(T, basicSet, n);
                 if (enter == -1)
                 {
+                    // Optimal
                     double z = T[0, n];
                     var xFull = ExtractPrimal(T, m, n, basis);
                     var xDecision = xFull.Take(Math.Min(model.NumVars, xFull.Length)).ToArray();
 
-                    //         MAYBE REMOVE
-
-                    // ---- Build sensitivity payload from current basis/tableau ----
+                    // Build sensitivity payload
                     int[] nonbasic = Enumerable.Range(0, n).Except(basis).ToArray();
 
-                    // B and N from the original (Phase II) A matrix
                     var B = new double[m, m];
                     for (int i = 0; i < m; i++)
                         for (int j = 0; j < m; j++)
@@ -110,29 +109,32 @@ namespace Solver.Engine.Simplex
                         for (int jj = 0; jj < nonbasic.Length; jj++)
                             Nmat[i, jj] = can.A[i, nonbasic[jj]];
 
-                    // Costs split by basis/nonbasis
                     var cB = basis.Select(j => can.c[j]).ToArray();
                     var cN = nonbasic.Select(j => can.c[j]).ToArray();
 
-                    // RHS from the current tableau column (already the basic values)
                     var bVec = new double[m];
                     for (int i = 0; i < m; i++) bVec[i] = T[i + 1, n];
 
-                    var payload = new Solver.Engine.Core.SensitivityPayload(
-                        B, Nmat, cB, cN, bVec, basis.ToArray(), nonbasic
+                    var BInv = Matrix.Invert(B);
+
+                    // y^T = cB^T B^{-1}
+                    var y = new double[m];
+                    for (int i = 0; i < m; i++)
+                    {
+                        double s = 0;
+                        for (int k = 0; k < m; k++) s += cB[k] * BInv[k, i];
+                        y[i] = s;
+                    }
+
+                    var payload = new SensitivityPayload(
+                        B, BInv, Nmat, cB, cN, bVec, basis.ToArray(), nonbasic, y
                     );
 
-                    // ---- Return with payload ----
-                    return new SolverResult(true, z, xDecision, log, sensitivity: payload);
-
-
-                    // ------------------------------------------------
-
-
-
-                    /*
                     log.Add("Optimality reached.");
-                    return new SolverResult(true, z, xDecision, log);*/
+                    return new SolverResult(true, z, xDecision, log)
+                    {
+                        Sensitivity = payload
+                    };
                 }
 
                 int leave = -1;
@@ -173,7 +175,7 @@ namespace Solver.Engine.Simplex
             return new SolverResult(false, 0, Array.Empty<double>(), log);
         }
 
-        // ---------- Phase I runner ----------
+        // ---------- Phase I ----------
         private sealed class PhaseIResult
         {
             public bool Success { get; init; }
@@ -188,7 +190,6 @@ namespace Solver.Engine.Simplex
             int n = can.A.GetLength(1);
             int width = n + 1;
 
-            // Build tableau for Phase I
             var T = new double[m + 1, n + 1];
             for (int i = 0; i < m; i++)
             {
@@ -207,7 +208,6 @@ namespace Solver.Engine.Simplex
             }
             var basicSet = new HashSet<int>(basis);
 
-            // Canonicalize z-row under Phase I costs
             for (int r = 0; r < m; r++)
             {
                 double cb = can.cPhaseI[basis[r]];
@@ -218,7 +218,6 @@ namespace Solver.Engine.Simplex
             var thetaDisp = ComputeThetaColumn(T, enter, m, n);
             log.Add(Printer.Render("Phase I — t-1", T, m, n, basis, can.NumVarsOriginal, enter, thetaDisp, can.Map.ColumnNames, can.Map.RowNames));
 
-            // Iterate
             int iter = 0;
             while (iter++ < MAX_ITERS)
             {
@@ -227,7 +226,6 @@ namespace Solver.Engine.Simplex
                 {
                     double zI = T[0, n];
                     log.Add($"Phase I optimum reached. z_I = {F(zI)}");
-                    // Because we maximize -Σ a_i, feasibility means zI == 0 (within EPS)
                     if (zI < -EPS)
                     {
                         log.Add("Phase I indicates infeasibility (z_I < 0).");
@@ -269,7 +267,7 @@ namespace Solver.Engine.Simplex
                 log.Add(Printer.Render("Phase I — t-1", T, m, n, basis, can.NumVarsOriginal, nextEnter, thetaNext, can.Map.ColumnNames, can.Map.RowNames));
             }
 
-            // Pivot artificials out if any remain in basis
+            // Remove artificials from basis
             var artSet = new HashSet<int>(can.ArtificialIdx ?? Array.Empty<int>());
             for (int r = 0; r < m; r++)
             {
@@ -291,7 +289,7 @@ namespace Solver.Engine.Simplex
                 basis[r] = pcol;
             }
 
-            // Remove artificial columns
+            // Drop artificial columns
             var keepCols = Enumerable.Range(0, n).Where(j => !artSet.Contains(j)).ToArray();
             int n2 = keepCols.Length;
             var A2 = new double[m, n2];
@@ -302,7 +300,6 @@ namespace Solver.Engine.Simplex
             var b2 = new double[m];
             for (int i = 0; i < m; i++) b2[i] = T[i + 1, n];
 
-            // Map basis to new col indices
             var pos = new Dictionary<int, int>();
             for (int jj = 0; jj < n2; jj++) pos[keepCols[jj]] = jj;
 
@@ -317,11 +314,9 @@ namespace Solver.Engine.Simplex
                 basis2[i] = colNew;
             }
 
-            // Build Phase II objective over reduced columns
             var c2 = new double[n2];
             for (int jj = 0; jj < n2; jj++) c2[jj] = can.c[keepCols[jj]];
 
-            // Remap names (drop artificials)
             var colNames2 = (can.Map.ColumnNames is { Length: > 0 })
                 ? keepCols.Select(j => can.Map.ColumnNames[j]).ToArray()
                 : Enumerable.Range(1, n2).Select(j => j <= can.NumVarsOriginal ? $"x{j}" : $"s{j - can.NumVarsOriginal}").ToArray();
