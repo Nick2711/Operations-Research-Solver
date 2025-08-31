@@ -354,16 +354,4 @@ window.initializeApp = () => {
         el.appendChild(pre);
     };
 
-    window.renderSensitivity = function (text) {
-        const el = document.getElementById('sensitivityOutput');
-        if (!el) return;
-        el.innerHTML = ""; // clear any previous content
-
-        const pre = document.createElement('pre');
-        pre.textContent = text;
-        el.appendChild(pre);
-    };
-
-
-
 };

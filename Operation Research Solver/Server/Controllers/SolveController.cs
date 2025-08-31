@@ -6,19 +6,27 @@ using System.Text;
 using System.Threading;
 using Microsoft.AspNetCore.Mvc;
 using Shared.Models;
-
 using Solver.Engine.IO;
 using Solver.Engine.Simplex;
 using Solver.Engine.Core;
 using Solver.Engine.Integer;
 using Solver.Engine.CuttingPlanes;
+using System.Text.RegularExpressions;
+
 
 namespace Server.Controllers
 {
     [ApiController]
-    [Route("api/[controller]")]
+    [Route("api/[controller]")] // => /api/solve
     public sealed class SolveController : ControllerBase
     {
+        private readonly ILastSolveCache _cache;
+        private static string? _lastModelText;   // cached raw LP text for follow-up edits
+
+        public SolveController(ILastSolveCache cache) => _cache = cache;
+
+        // ===================== MAIN SOLVE =====================
+        // This is the ONLY action that handles POST /api/solve
         [HttpPost]
         public ActionResult<SolveResponse> Post([FromBody] SolveRequest req, CancellationToken ct)
         {
@@ -30,7 +38,6 @@ namespace Server.Controllers
             if (string.IsNullOrWhiteSpace(req.ModelText))
                 return BadRequest(new SolveResponse { OutputText = "Error: ModelText is empty." });
 
-            // Time limit (optional)
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             if (req.Settings != null && req.Settings.TimeLimitSeconds > 0)
                 cts.CancelAfter(TimeSpan.FromSeconds(req.Settings.TimeLimitSeconds));
@@ -38,9 +45,8 @@ namespace Server.Controllers
 
             try
             {
-                // Parse text -> model (ModelParser owns normalization/cleaning and algebraic fallback)
+                // Parse
                 var model = ModelParser.Parse(req.ModelText);
-
                 if (model == null)
                 {
                     sw.Stop();
@@ -52,7 +58,7 @@ namespace Server.Controllers
                     });
                 }
 
-                // Pick solver from enum
+                // Pick solver
                 ISolver solver = req.Algorithm switch
                 {
                     Algorithm.Knapsack01 => new Knapsack01Solver(),
@@ -63,7 +69,6 @@ namespace Server.Controllers
                     _ => new PrimalSimplexSolver()
                 };
 
-                // If MIN and caller didn't explicitly request BranchAndBound/Knapsack, prefer Dual Simplex
                 if (model.Direction == OptimizeDirection.Min &&
                     req.Algorithm != Algorithm.BranchAndBound &&
                     req.Algorithm != Algorithm.Knapsack01)
@@ -74,11 +79,14 @@ namespace Server.Controllers
                 token.ThrowIfCancellationRequested();
 
                 var result = solver.Solve(model);
+
+                // ✅ Cache results for sensitivity + remember raw text
                 _cache.LastResult = result;
+                _lastModelText = req.ModelText;
 
                 token.ThrowIfCancellationRequested();
 
-                // Build output text
+                // Build output
                 var outText = new StringBuilder();
                 outText.AppendLine($"Algorithm: {solver.Name}");
 
@@ -86,27 +94,22 @@ namespace Server.Controllers
                 {
                     var linesToShow = (req.Settings?.Verbose ?? true)
                         ? result.Log
-                        : result.Log.Take(100); // show more by default when not verbose
-                    foreach (var l in linesToShow)
-                        outText.AppendLine(l);
+                        : result.Log.Take(100);
+                    foreach (var l in linesToShow) outText.AppendLine(l);
                 }
 
-                // Convert objective to the user's original sense (if solvers normalized internally)
                 double userObjective = result.Success
-                    ? (model.Direction == OptimizeDirection.Max
-                        ? result.ObjectiveValue
-                        : -result.ObjectiveValue)
+                    ? (model.Direction == OptimizeDirection.Max ? result.ObjectiveValue : -result.ObjectiveValue)
                     : 0.0;
 
                 outText.AppendLine();
                 if (result.Success)
                 {
                     outText.AppendLine($"SUCCESS — Objective: {userObjective.ToString("0.###", CultureInfo.InvariantCulture)}");
-
                     if (result.X is { Length: > 0 })
                     {
-                        var sol = string.Join(", ",
-                            result.X.Select((v, i) => $"x{i + 1}={(double.IsNaN(v) ? "NaN" : v.ToString("0.###", CultureInfo.InvariantCulture))}"));
+                        var sol = string.Join(", ", result.X.Select((v, i) =>
+                            $"x{i + 1}={(double.IsNaN(v) ? "NaN" : v.ToString("0.###", CultureInfo.InvariantCulture))}"));
                         outText.AppendLine("Solution: " + sol);
                     }
                 }
@@ -140,17 +143,9 @@ namespace Server.Controllers
             catch (Exception ex)
             {
                 sw.Stop();
-
-                // 🔎 Echo normalized lines to diagnose invisible characters / tokenization issues
                 string normalized;
-                try
-                {
-                    normalized = string.Join("\n", ModelParser.DebugNormalizeToLines(req.ModelText));
-                }
-                catch
-                {
-                    normalized = "(failed to normalize)";
-                }
+                try { normalized = string.Join("\n", ModelParser.DebugNormalizeToLines(req.ModelText)); }
+                catch { normalized = "(failed to normalize)"; }
 
                 var msg = new StringBuilder();
                 msg.AppendLine($"Error: {ex.Message}");
@@ -169,12 +164,84 @@ namespace Server.Controllers
             }
         }
 
-        private readonly ILastSolveCache _cache;
-        public SolveController(ILastSolveCache cache)
+        // ===================== CHANGE RHS (re-solve) =====================
+        public record ChangeRhsRequest(int ConstraintIndex, double NewRhs);
+
+        // POST /api/solve/change-rhs
+        [HttpPost("change-rhs")]
+        public IActionResult ChangeRhs([FromBody] ChangeRhsRequest req)
         {
-            _cache = cache;
+            // lines: 0 objective, ... constraints ..., last = variable restrictions
+            var rawLines = _lastModelText.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None).ToList();
+            if (rawLines.Count < 2) return BadRequest("Model text too short.");
+
+            // Build a list of actual constraint lines by detecting an operator (<=, >=, =, ≤, ≥)
+            var opRegexAscii = new Regex(@"(<=|>=|=)\s*(-?\d+(?:\.\d+)?(?:[eE][\+\-]?\d+)?)");
+            var opRegexUnicode = new Regex(@"(≤|≥|=)\s*(-?\d+(?:\.\d+)?(?:[eE][\+\-]?\d+)?)");
+
+            var constraintLineIndices = rawLines
+                .Select((text, idx) => new { text, idx })
+                // skip empty lines and comments
+                .Where(t => !string.IsNullOrWhiteSpace(t.text) && !t.text.TrimStart().StartsWith("#"))
+                // exclude the last non-empty line if it's variable restrictions (all tokens are words like bin/int/urs/+/-)
+                .Where(t =>
+                {
+                    var tokens = t.text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                    bool looksLikeRestrictions = tokens.All(tok =>
+                        tok.Equals("bin", StringComparison.OrdinalIgnoreCase) ||
+                        tok.Equals("int", StringComparison.OrdinalIgnoreCase) ||
+                        tok.Equals("urs", StringComparison.OrdinalIgnoreCase) ||
+                        tok == "+" || tok == "-");
+                    return !looksLikeRestrictions;
+                })
+                // keep lines that have an operator + RHS number
+                .Where(t => opRegexAscii.IsMatch(t.text) || opRegexUnicode.IsMatch(t.text))
+                .Select(t => t.idx)
+                .ToList();
+
+            if (constraintLineIndices.Count == 0)
+                return BadRequest("No constraint lines with an operator were detected in the model.");
+
+            if (req.ConstraintIndex < 0 || req.ConstraintIndex >= constraintLineIndices.Count)
+                return BadRequest($"Constraint index out of range. Found {constraintLineIndices.Count} constraint(s), 0-based.");
+
+            // Pick the requested constraint line by index into the detected list
+            int lineIdx = constraintLineIndices[req.ConstraintIndex];
+            string line = rawLines[lineIdx];
+
+            // Find the operator+RHS on that line
+            var m = opRegexAscii.Match(line);
+            if (!m.Success) m = opRegexUnicode.Match(line);
+            if (!m.Success)
+                return BadRequest($"Could not find operator/RHS on constraint line:\n{line}");
+
+            // Preserve whether there was a space between operator and number
+            string opToken = m.Groups[1].Value;  // "<=", ">=", "=", "≤", "≥"
+            bool hadSpace = m.Value.Contains(" ");
+            string newRhsStr = req.NewRhs.ToString(CultureInfo.InvariantCulture);
+
+            // Replace only the matched operator+number segment
+            line = line.Remove(m.Index, m.Length)
+                       .Insert(m.Index, hadSpace ? $"{opToken} {newRhsStr}" : $"{opToken}{newRhsStr}");
+
+            rawLines[lineIdx] = line;
+
+            var newText = string.Join("\n", rawLines);
+
+            // Re-solve with Primal Simplex (or pick based on last request if you wish)
+            var model = ModelParser.Parse(newText);
+            ISolver solver = new PrimalSimplexSolver();
+            var result = solver.Solve(model);
+
+            // Update cache for subsequent actions
+            _lastModelText = newText;
+            _cache.LastResult = result;
+
+            var output = string.Join("\n", result.Log) +
+                         $"\n\nThe new objective value is: {result.ObjectiveValue:0.####}";
+
+            return Content(output, "text/plain");
+
         }
-
     }
-
 }
