@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.ResponseCompression;
+using Operation_Research_Solver.Server.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -12,6 +13,7 @@ builder.WebHost.ConfigureKestrel(options =>
 // Services
 builder.Services.AddControllersWithViews();
 builder.Services.AddRazorPages();
+builder.Services.AddSingleton<ILastSolveCache, LastSolveCache>();
 builder.Services.AddSingleton<ILastSolveCache, LastSolveCache>();
 
 

@@ -13,6 +13,7 @@ using Solver.Engine.Integer;
 using Solver.Engine.CuttingPlanes;
 using System.Text.RegularExpressions;
 using System.Globalization;
+using Operation_Research_Solver.Server.Services;
 
 namespace Server.Controllers
 {
