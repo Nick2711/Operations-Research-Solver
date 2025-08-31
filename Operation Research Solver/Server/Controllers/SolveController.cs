@@ -74,6 +74,7 @@ namespace Server.Controllers
                 token.ThrowIfCancellationRequested();
 
                 var result = solver.Solve(model);
+                _cache.LastResult = result;
 
                 token.ThrowIfCancellationRequested();
 
@@ -167,5 +168,13 @@ namespace Server.Controllers
                 });
             }
         }
+
+        private readonly ILastSolveCache _cache;
+        public SolveController(ILastSolveCache cache)
+        {
+            _cache = cache;
+        }
+
     }
+
 }
