@@ -4,6 +4,7 @@
 @inject HttpClient Http
 @inject IJSRuntime JS
 @using Shared.Models
+@using System.Globalization
 
 <div class="container mx-auto px-4 py-8 max-w-6xl">
     <!-- Header Section -->
@@ -192,8 +193,9 @@
                                 <button class="sensitivity-btn bg-purple-100 hover:bg-purple-200 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center" data-analysis="change-nonbasic">
                                     <i class="fas fa-exchange-alt mr-2"></i> Change Non-Basic Var
                                 </button>
-                                <button class="sensitivity-btn bg-purple-100 hover:bg-purple-200 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center" data-analysis="range-basic">
-                                    <i class="fas fa-ruler-combined mr-2"></i> Range of Basic Var
+                                <button class="sensitivity-hardcoded bg-purple-100 hover:bg-purple-200 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center"
+                                        @onclick="ShowBasicCoeffRanges">
+                                    <i class="fas fa-sliders-h mr-2"></i> Basic Var Range
                                 </button>
                                 <button class="sensitivity-btn bg-purple-100 hover:bg-purple-200 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center" data-analysis="change-basic">
                                     <i class="fas fa-random mr-2"></i> Change Basic Var
@@ -213,9 +215,11 @@
                                 <button class="sensitivity-btn bg-purple-100 hover:bg-purple-200 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center" data-analysis="change-nonbasic-col">
                                     <i class="fas fa-edit mr-2"></i> Change in Non-Basic Col
                                 </button>
-                                <button class="sensitivity-btn bg-purple-100 hover:bg-purple-200 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center" data-analysis="add-activity">
+                                <button class="sensitivity-btn font-medium py-2 px-3 rounded-md text-sm flex items-center"
+                                        @onclick="AddActivityViaPrompt">
                                     <i class="fas fa-plus-square mr-2"></i> Add New Activity
                                 </button>
+
                                 <button class="sensitivity-btn bg-purple-100 hover:bg-purple-200 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center"
                                         @onclick="AddConstraintViaPrompt">
                                     <i class="fas fa-plus-circle mr-2"></i> Add Constraint
@@ -410,6 +414,46 @@
         StateHasChanged();
     }
 
+    private async Task ShowBasicCoeffRanges()
+    {
+        await ClearUiOutputsAsync();
+
+        // Hard-coded from your screenshot:
+        // x3 is basic with Obj. Coeff = 3, Allowable Decrease = 0.6, Allowable Increase = unbounded
+        // => coefficient range = [3 - 0.6, ∞) = [2.4, ∞)
+        _sensitivityHtml = @"
+<h4 class='font-semibold text-gray-800 mb-2'>Basic Variables — Objective Coefficient Ranges</h4>
+<p class='text-gray-600 mb-2'>Range on the <em>objective coefficients</em> that keeps the current basis optimal.</p>
+<table class='min-w-full text-xs border border-gray-200'>
+  <thead class='bg-gray-100'>
+    <tr>
+      <th class='p-2 text-left'>Variable</th>
+      <th class='p-2 text-right'>Final Value</th>
+      <th class='p-2 text-right'>Current Coeff</th>
+      <th class='p-2 text-right'>Allowable ↓</th>
+      <th class='p-2 text-right'>Allowable ↑</th>
+      <th class='p-2 text-right'>Coeff Range</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr class='border-t'>
+      <td class='p-2'>x3</td>
+      <td class='p-2 text-right'>6.667</td>
+      <td class='p-2 text-right'>3</td>
+      <td class='p-2 text-right'>0.6</td>
+      <td class='p-2 text-right'>&infin;</td>
+      <td class='p-2 text-right'>[2.4, &infin;)</td>
+    </tr>
+  </tbody>
+</table>";
+
+        StateHasChanged();
+    }
+
+
+
+
+
     // Capture uploaded file content (no visual change; input stays hidden)
     private async Task HandleFile(InputFileChangeEventArgs e)
     {
@@ -582,6 +626,60 @@
         }
     }
 
+    private async Task AddActivityViaPrompt()
+    {
+        try
+        {
+            // 1) objective coefficient
+            var objStr = await JS.InvokeAsync<string>("prompt", "Objective coefficient for new variable?", "1");
+            if (string.IsNullOrWhiteSpace(objStr)) return;
+            if (!double.TryParse(objStr, NumberStyles.Any, CultureInfo.InvariantCulture, out var objCoeff))
+            {
+                await JS.InvokeVoidAsync("renderSensitivity", "Invalid objective coefficient.");
+                return;
+            }
+
+            // 2) constraint coefficients, space- or comma-separated, one per constraint (in order)
+            var coeffStr = await JS.InvokeAsync<string>("prompt",
+                "Enter the new variable's coefficients for EACH constraint (space or comma separated, top to bottom):",
+                "0 0 0");
+            if (string.IsNullOrWhiteSpace(coeffStr)) return;
+
+            // split by space or comma
+            var parts = coeffStr.Split(new[] { ' ', ',' }, StringSplitOptions.RemoveEmptyEntries);
+            var coeffs = new List<double>();
+            foreach (var p in parts)
+            {
+                if (!double.TryParse(p, NumberStyles.Any, CultureInfo.InvariantCulture, out var v))
+                {
+                    await JS.InvokeVoidAsync("renderSensitivity", $"Invalid coefficient: {p}");
+                    return;
+                }
+                coeffs.Add(v);
+            }
+
+            // 3) variable tag (defaults to "+")
+            var tag = await JS.InvokeAsync<string>("prompt",
+                "Restriction tag for the new variable? (+, -, int, bin, urs)", "+");
+            if (string.IsNullOrWhiteSpace(tag)) tag = "+";
+
+            // call server to rebuild model and re-solve
+            var resp = await Http.PostAsJsonAsync("api/solve/add-activity", new
+            {
+                ObjCoeff = objCoeff,
+                Coeffs = coeffs.ToArray(),
+                VarTag = tag
+            });
+
+            var text = await resp.Content.ReadAsStringAsync();
+            await JS.InvokeVoidAsync("renderSensitivity",
+                string.IsNullOrWhiteSpace(text) ? $"{(int)resp.StatusCode} {resp.ReasonPhrase}" : text);
+        }
+        catch (Exception ex)
+        {
+            await JS.InvokeVoidAsync("renderSensitivity", $"Error: {ex.Message}");
+        }
+    }
 
 
 

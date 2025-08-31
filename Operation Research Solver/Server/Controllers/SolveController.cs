@@ -12,6 +12,7 @@ using Solver.Engine.Core;
 using Solver.Engine.Integer;
 using Solver.Engine.CuttingPlanes;
 using System.Text.RegularExpressions;
+using System.Globalization;
 
 namespace Server.Controllers
 {
@@ -602,5 +603,108 @@ namespace Server.Controllers
 
             return Ok(new { success = true, output = results });
         }*/
+
+        // ===================== ADD ACTIVITY (re-solve) =====================
+        public record AddActivityRequest(double ObjCoeff, double[] Coeffs, string VarTag);
+
+        [HttpOptions("add-activity")]
+        public IActionResult OptionsAddActivity()
+        {
+            // let the browser's preflight succeed
+            Response.Headers["Access-Control-Allow-Methods"] = "POST, OPTIONS";
+            Response.Headers["Access-Control-Allow-Headers"] = "content-type";
+            return Ok();
+        }
+
+        [HttpPost("add-activity")]
+        public IActionResult AddActivity([FromBody]AddActivityRequest req)
+        {
+            if (string.IsNullOrWhiteSpace(_lastModelText))
+                return BadRequest("No model text in memory. Solve a model first.");
+
+            // Parse cached model into segments
+            var inv = CultureInfo.InvariantCulture;
+            var lines = _lastModelText.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None).ToList();
+            if (lines.Count < 2) return BadRequest("Model text too short.");
+
+            // objective is first line
+            var objLine = lines[0].Trim();
+            if (string.IsNullOrWhiteSpace(objLine)) return BadRequest("Objective line missing.");
+
+            // find restrictions line (last non-empty line with only + - int bin urs)
+            int restrictionsIdx = -1;
+            for (int i = lines.Count - 1; i >= 0; i--)
+            {
+                var t = lines[i].Trim();
+                if (string.IsNullOrEmpty(t)) continue;
+                var toks = t.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                bool looksRestr = toks.All(tok =>
+                    tok.Equals("+", StringComparison.OrdinalIgnoreCase) ||
+                    tok.Equals("-", StringComparison.OrdinalIgnoreCase) ||
+                    tok.Equals("int", StringComparison.OrdinalIgnoreCase) ||
+                    tok.Equals("bin", StringComparison.OrdinalIgnoreCase) ||
+                    tok.Equals("urs", StringComparison.OrdinalIgnoreCase));
+                if (looksRestr) { restrictionsIdx = i; break; }
+            }
+            if (restrictionsIdx == -1) return BadRequest("Could not locate variable restrictions line.");
+
+            // constraint lines are 1..(restrictionsIdx-1)
+            var constraintIdxs = Enumerable.Range(1, restrictionsIdx - 1).ToList();
+            int m = constraintIdxs.Count;
+            if (req.Coeffs == null || req.Coeffs.Length != m)
+                return BadRequest($"Expected {m} coefficients for the new variable, got {req.Coeffs?.Length ?? 0}.");
+
+            // helper: signed formatting like +3 / -2
+            string Signed(double v) => (v >= 0 ? "+" : "") + v.ToString(inv);
+
+            // 1) append objective coefficient
+            objLine = objLine + " " + Signed(req.ObjCoeff);
+            lines[0] = objLine;
+
+            // 2) insert new column coeff before each constraint’s operator
+            var opAscii = new Regex(@"(<=|>=|=)\s*(-?\d+(?:\.\d+)?(?:[eE][\+\-]?\d+)?)");
+            var opUni = new Regex(@"(≤|≥|=)\s*(-?\d+(?:\.\d+)?(?:[eE][\+\-]?\d+)?)");
+
+            for (int k = 0; k < m; k++)
+            {
+                int idx = constraintIdxs[k];
+                string ln = lines[idx];
+
+                var match = opAscii.Match(ln);
+                if (!match.Success) match = opUni.Match(ln);
+                if (!match.Success) return BadRequest($"Could not find operator/RHS in constraint line:\n{ln}");
+
+                // split "lhs  op  rhs" and inject new coeff at end of lhs
+                string lhs = ln.Substring(0, match.Index).TrimEnd();
+                string tail = ln.Substring(match.Index);
+                lhs = string.IsNullOrEmpty(lhs) ? Signed(req.Coeffs[k]) : $"{lhs} {Signed(req.Coeffs[k])}";
+                lines[idx] = lhs + " " + tail;
+            }
+
+            // 3) append variable tag to restrictions (default to "+")
+            var tag = string.IsNullOrWhiteSpace(req.VarTag) ? "+" : req.VarTag.Trim();
+            lines[restrictionsIdx] = (lines[restrictionsIdx].Trim() + " " + tag).Trim();
+
+            // rebuild text and re-solve
+            var newText = string.Join("\n", lines);
+            var model = ModelParser.Parse(newText);
+            if (model == null) return BadRequest("Model parse failed after adding activity.");
+
+            ISolver solver = new PrimalSimplexSolver();
+            var result = solver.Solve(model);
+
+            // update cache
+            _lastModelText = newText;
+            _cache.LastResult = result;
+
+            var output = string.Join("\n", result.Log ?? new List<string>()) +
+                         $"\n\nThe new objective value is: {result.ObjectiveValue:0.####}";
+            return Content(output, "text/plain");
+        }
+
+
+
+
+
     }
 }
