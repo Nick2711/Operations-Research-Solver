@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using Solver.Engine.Core;
 using Solver.Engine.IO;
+using Solver.Engine.Sensitivity;
 using static Solver.Engine.Core.Numeric;
 using static Solver.Engine.Simplex.TableauOps;
 
@@ -92,8 +93,46 @@ namespace Solver.Engine.Simplex
                     double z = T[0, n];
                     var xFull = ExtractPrimal(T, m, n, basis);
                     var xDecision = xFull.Take(Math.Min(model.NumVars, xFull.Length)).ToArray();
+
+                    //         MAYBE REMOVE
+
+                    // ---- Build sensitivity payload from current basis/tableau ----
+                    int[] nonbasic = Enumerable.Range(0, n).Except(basis).ToArray();
+
+                    // B and N from the original (Phase II) A matrix
+                    var B = new double[m, m];
+                    for (int i = 0; i < m; i++)
+                        for (int j = 0; j < m; j++)
+                            B[i, j] = can.A[i, basis[j]];
+
+                    var Nmat = new double[m, n - m];
+                    for (int i = 0; i < m; i++)
+                        for (int jj = 0; jj < nonbasic.Length; jj++)
+                            Nmat[i, jj] = can.A[i, nonbasic[jj]];
+
+                    // Costs split by basis/nonbasis
+                    var cB = basis.Select(j => can.c[j]).ToArray();
+                    var cN = nonbasic.Select(j => can.c[j]).ToArray();
+
+                    // RHS from the current tableau column (already the basic values)
+                    var bVec = new double[m];
+                    for (int i = 0; i < m; i++) bVec[i] = T[i + 1, n];
+
+                    var payload = new Solver.Engine.Core.SensitivityPayload(
+                        B, Nmat, cB, cN, bVec, basis.ToArray(), nonbasic
+                    );
+
+                    // ---- Return with payload ----
+                    return new SolverResult(true, z, xDecision, log, sensitivity: payload);
+
+
+                    // ------------------------------------------------
+
+
+
+                    /*
                     log.Add("Optimality reached.");
-                    return new SolverResult(true, z, xDecision, log);
+                    return new SolverResult(true, z, xDecision, log);*/
                 }
 
                 int leave = -1;

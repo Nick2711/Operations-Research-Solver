@@ -12,6 +12,8 @@ builder.WebHost.ConfigureKestrel(options =>
 // Services
 builder.Services.AddControllersWithViews();
 builder.Services.AddRazorPages();
+builder.Services.AddSingleton<ILastSolveCache, LastSolveCache>();
+
 
 var app = builder.Build();
 

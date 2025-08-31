@@ -36,6 +36,7 @@ window.initializeApp = () => {
                 }, 10);
             }
         });
+
     });
 
     // File Upload & Preview with Drag and Drop
@@ -216,4 +217,152 @@ window.initializeApp = () => {
     // Initialize first tab as active
     const firstTabBtn = document.querySelector('.tab-btn');
     if (firstTabBtn) firstTabBtn.click();
+
+    // Sensitivity button click handlers --- ANYTHING PAST THIS POINT CAN BE CHANGED
+    document.querySelectorAll('.sensitivity-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const analysisType = btn.dataset.analysis;
+            const outputDiv = document.getElementById('sensitivityOutput');
+
+            // Reset chart if exists
+            if (window.sensitivityChartInstance) {
+                window.sensitivityChartInstance.destroy();
+                window.sensitivityChartInstance = null;
+            }
+
+            outputDiv.innerHTML = `<p class="text-gray-500 italic">Running ${analysisType}...</p>`;
+
+            try {
+
+                // inside the sensitivity button click handler, before fetch()
+                let body = { analysisType, modelText: document.getElementById('filePreview').textContent };
+
+                if (analysisType === 'range-nonbasic') {
+                    const v = prompt('Enter variable index (1-based):');
+                    if (!v) return;
+                    body.varIndex = parseInt(v, 10) - 1;
+                }
+
+                if (analysisType === 'range-rhs') {
+                    const c = prompt('Enter constraint index (1-based):');
+                    if (!c) return;
+                    body.constraintIndex = parseInt(c, 10) - 1;
+                }
+
+                // then pass `body` into JSON.stringify(body) in your fetch
+
+
+                const resp = await fetch("/api/sensitivity/analyze", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ analysisType, modelText: document.getElementById('filePreview').textContent })
+
+                    //body: JSON.stringify({ analysisType })
+                });
+
+                const data = await resp.json();
+
+                if (!data.success) {
+                    outputDiv.innerHTML = `<p class="text-red-500">Error: ${data.error}</p>`;
+                    return;
+                }
+
+                // Render table
+                renderTable(outputDiv, data.output);
+
+                // Optional: render chart if numeric data present
+                if (Array.isArray(data.output) && data.output.length && 'Value' in data.output[0]) {
+                    renderChart('sensitivityChart', data.output, 'Variable', 'Value');
+                }
+
+            } catch (err) {
+                outputDiv.innerHTML = `<p class="text-red-500">Error calling API: ${err}</p>`;
+            }
+        });
+    });
+
+    // ------------------ Helper functions ------------------
+
+    function renderTable(container, data) {
+        if (!data || typeof data !== 'object') {
+            container.innerHTML = `<pre>${JSON.stringify(data, null, 2)}</pre>`;
+            return;
+        }
+
+        let keys = [];
+        if (Array.isArray(data) && data.length && typeof data[0] === 'object') {
+            keys = Object.keys(data[0]);
+        } else if (!Array.isArray(data)) {
+            keys = Object.keys(data);
+            data = [data];
+        }
+
+        let table = '<table class="min-w-full border border-gray-300 text-sm">';
+        table += '<thead class="bg-gray-100"><tr>';
+        keys.forEach(k => table += `<th class="border px-2 py-1 text-left">${k}</th>`);
+        table += '</tr></thead><tbody>';
+
+        data.forEach(row => {
+            table += '<tr>';
+            keys.forEach(k => table += `<td class="border px-2 py-1">${row[k]}</td>`);
+            table += '</tr>';
+        });
+
+        table += '</tbody></table>';
+        container.innerHTML = table;
+    }
+
+    let sensitivityChartInstance = null;
+
+    function renderChart(canvasId, data, xKey = 'Variable', yKey = 'Value') {
+        const ctx = document.getElementById(canvasId).getContext('2d');
+
+        const labels = data.map(d => d[xKey] ?? d.label ?? '');
+        const values = data.map(d => d[yKey] ?? d.value ?? 0);
+
+        if (sensitivityChartInstance) sensitivityChartInstance.destroy();
+
+        sensitivityChartInstance = new Chart(ctx, {
+            type: 'bar',
+            data: {
+                labels: labels,
+                datasets: [{
+                    label: yKey,
+                    data: values,
+                    backgroundColor: 'rgba(59, 130, 246, 0.6)',
+                    borderColor: 'rgba(59, 130, 246, 1)',
+                    borderWidth: 1
+                }]
+            },
+            options: {
+                responsive: true,
+                plugins: { legend: { display: false } },
+                scales: { y: { beginAtZero: true } }
+            }
+        });
+
+        // Save globally for reset
+        window.sensitivityChartInstance = sensitivityChartInstance;
+    }
+
+    window.renderSensitivity = function (text) {
+        const el = document.getElementById('sensitivityOutput');
+        if (!el) return;
+        el.innerHTML = "";
+        const pre = document.createElement('pre');
+        pre.textContent = text;
+        el.appendChild(pre);
+    };
+
+    window.renderSensitivity = function (text) {
+        const el = document.getElementById('sensitivityOutput');
+        if (!el) return;
+        el.innerHTML = ""; // clear any previous content
+
+        const pre = document.createElement('pre');
+        pre.textContent = text;
+        el.appendChild(pre);
+    };
+
+
 };
