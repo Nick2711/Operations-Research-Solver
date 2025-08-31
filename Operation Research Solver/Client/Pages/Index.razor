@@ -217,20 +217,17 @@
                                 <button class="sensitivity-btn bg-purple-100 hover:bg-purple-200 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center" data-analysis="add-activity">
                                     <i class="fas fa-plus-square mr-2"></i> Add New Activity
                                 </button>
-                                <button class="sensitivity-btn bg-purple-100 hover:bg-purple-200 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center" data-analysis="add-constraint">
+                                <button class="sensitivity-btn bg-purple-100 hover:bg-purple-200 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center"
+                                        @onclick="AddConstraintViaPrompt">
                                     <i class="fas fa-plus-circle mr-2"></i> Add Constraint
                                 </button>
+
                                 <button class="sensitivity-btn bg-purple-100 hover:bg-purple-200 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center" data-analysis="shadow-prices">
                                     <i class="fas fa-project-diagram mr-2" @onclick='() => CallSensitivity("shadow-prices")'></i> Shadow Prices
                                 </button>
-                                <button class="sensitivity-btn bg-purple-100 hover:bg-purple-200 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center" data-analysis="apply-duality">
+                                <button class="sensitivity-btn bg-purple-100 hover:bg-purple-200 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center"
+                                        @onclick="ApplyDuality">
                                     <i class="fas fa-code-branch mr-2"></i> Apply Duality
-                                </button>
-                                <button class="sensitivity-btn bg-purple-100 hover:bg-purple-200 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center" data-analysis="solve-dual">
-                                    <i class="fas fa-arrows-alt-h mr-2"></i> Solve Dual Model
-                                </button>
-                                <button class="sensitivity-btn bg-purple-100 hover:bg-purple-200 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center" data-analysis="verify-duality">
-                                    <i class="fas fa-check-double mr-2"></i> Verify Duality
                                 </button>
                             </div>
                         </div>
@@ -440,7 +437,57 @@
         }
     }
 
+    private async Task AddConstraintViaPrompt()
+    {
+        try
+        {
+            var line = await JS.InvokeAsync<string>("prompt",
+                "Enter new constraint (e.g., 5 3 10 6 0 0 <= 10):", "5 3 10 6 0 0 <= 10");
+            if (string.IsNullOrWhiteSpace(line)) return;
 
+            var resp = await Http.PostAsJsonAsync("api/solve/add-constraint", new { ConstraintText = line });
+            var text = await resp.Content.ReadAsStringAsync();
+
+            await JS.InvokeVoidAsync("renderSensitivity",
+                string.IsNullOrWhiteSpace(text) ? $"{(int)resp.StatusCode} {resp.ReasonPhrase}" : text);
+        }
+        catch (Exception ex)
+        {
+            await JS.InvokeVoidAsync("renderSensitivity", $"Error: {ex.Message}");
+        }
+    }
+
+    private async Task ApplyDuality()
+    {
+        try
+        {
+            var resp = await Http.PostAsync("api/solve/apply-duality", null);
+            var raw = await resp.Content.ReadAsStringAsync();
+
+            // Pretty-print JSON if it is JSON, else show raw text
+            string display;
+            if (resp.IsSuccessStatusCode &&
+                !string.IsNullOrWhiteSpace(raw) &&
+                (raw.TrimStart().StartsWith("{") || raw.TrimStart().StartsWith("[")))
+            {
+                using var doc = System.Text.Json.JsonDocument.Parse(raw);
+                display = System.Text.Json.JsonSerializer.Serialize(
+                    doc, new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
+            }
+            else
+            {
+                display = string.IsNullOrWhiteSpace(raw)
+                    ? $"{(int)resp.StatusCode} {resp.ReasonPhrase}"
+                    : raw;
+            }
+
+            await JS.InvokeVoidAsync("renderSensitivity", display);
+        }
+        catch (Exception ex)
+        {
+            await JS.InvokeVoidAsync("renderSensitivity", $"Error: {ex.Message}");
+        }
+    }
 
 
 

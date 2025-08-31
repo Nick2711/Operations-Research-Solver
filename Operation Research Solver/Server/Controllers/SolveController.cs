@@ -243,5 +243,294 @@ namespace Server.Controllers
             return Content(output, "text/plain");
 
         }
+
+        // ===================== ADD CONSTRAINT (re-solve) =====================
+        public record AddConstraintRequest(string ConstraintText);
+
+        [HttpPost("add-constraint")]
+        public IActionResult AddConstraint([FromBody] AddConstraintRequest req)
+        {
+            if (string.IsNullOrWhiteSpace(_lastModelText))
+                return BadRequest("No model text in memory. Solve a model first.");
+
+            if (string.IsNullOrWhiteSpace(req.ConstraintText))
+                return BadRequest("Constraint text is empty.");
+
+            // Split cached model into lines
+            var lines = _lastModelText.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None).ToList();
+            if (lines.Count < 2) return BadRequest("Model text too short.");
+
+            var objLine = lines[0].Trim();
+            var objParts = objLine.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+            if (objParts.Length < 2) return BadRequest("Objective line invalid.");
+            int numVars = objParts.Length - 1;  // first token = max/min, rest are coeffs
+
+            // Parse new constraint text: "<coeffs...> <op> <rhs>" (supports <=, >=, = and ≤/≥; space optional before RHS)
+            var raw = req.ConstraintText.Trim();
+            if (raw.StartsWith("#")) return BadRequest("Constraint cannot be a comment.");
+
+            // Find operator and rhs with regex
+            var m = Regex.Match(raw, @"(<=|>=|=)\s*(-?\d+(?:\.\d+)?(?:[eE][\+\-]?\d+)?)");
+            if (!m.Success) m = Regex.Match(raw, @"(≤|≥|=)\s*(-?\d+(?:\.\d+)?(?:[eE][\+\-]?\d+)?)");
+            if (!m.Success) return BadRequest("Could not find operator/RHS in the new constraint.");
+
+            string opToken = m.Groups[1].Value;  // "<=", ">=", "=", "≤", "≥"
+            string rhsText = m.Groups[2].Value;
+
+            // Coeffs are everything before the operator match
+            string coeffsRegion = raw.Substring(0, m.Index).Trim();
+            var coeffTokens = coeffsRegion.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+
+            if (coeffTokens.Length != numVars)
+                return BadRequest($"Expected {numVars} coefficients but found {coeffTokens.Length}.");
+
+            // Validate coefficients are numbers
+            foreach (var t in coeffTokens)
+                if (!double.TryParse(t, NumberStyles.Any, CultureInfo.InvariantCulture, out _))
+                    return BadRequest($"Coefficient '{t}' is not a number.");
+
+            // Validate RHS
+            if (!double.TryParse(rhsText, NumberStyles.Any, CultureInfo.InvariantCulture, out _))
+                return BadRequest($"RHS '{rhsText}' is not a number.");
+
+            // Normalize the new constraint line: keep tokens as given; ensure a space before RHS
+            var normalizedConstraint = $"{string.Join(' ', coeffTokens)} {opToken} {rhsText}";
+
+            // Find the variable restrictions line (last non-empty line with only bin/int/urs/+/- tokens)
+            int restrictionsIdx = -1;
+            for (int i = lines.Count - 1; i >= 0; i--)
+            {
+                var text = lines[i].Trim();
+                if (string.IsNullOrEmpty(text)) continue;
+
+                var toks = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                bool looksLikeRestrictions = toks.All(tok =>
+                    tok.Equals("bin", StringComparison.OrdinalIgnoreCase) ||
+                    tok.Equals("int", StringComparison.OrdinalIgnoreCase) ||
+                    tok.Equals("urs", StringComparison.OrdinalIgnoreCase) ||
+                    tok == "+" || tok == "-");
+
+                if (looksLikeRestrictions)
+                {
+                    restrictionsIdx = i;
+                    break;
+                }
+            }
+
+            if (restrictionsIdx == -1)
+                return BadRequest("Could not locate variable restrictions line to insert before.");
+
+            // Insert the new constraint right before restrictions
+            lines.Insert(restrictionsIdx, normalizedConstraint);
+
+            var newText = string.Join("\n", lines);
+
+            // Re-solve
+            var model = ModelParser.Parse(newText);
+            ISolver solver = new PrimalSimplexSolver();
+            var result = solver.Solve(model);
+
+            // Update cache
+            _lastModelText = newText;
+            _cache.LastResult = result;
+
+            var output = string.Join("\n", result.Log) +
+                         $"\n\nThe new objective value is: {result.ObjectiveValue:0.####}";
+
+            return Content(output, "text/plain");
+        }
+
+        // ===================== APPLY DUALITY (build dual, solve, text output) =====================
+        public record ApplyDualityResponse(string DualModelText, string OutputText, string Summary);
+
+        [HttpPost("apply-duality")]
+        public IActionResult ApplyDuality()
+        {
+            if (string.IsNullOrWhiteSpace(_lastModelText))
+                return BadRequest("No model text in memory. Solve a model first.");
+
+            var lines = _lastModelText.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None)
+                                      .Where(l => !string.IsNullOrWhiteSpace(l))
+                                      .Select(l => l.Trim())
+                                      .ToList();
+            if (lines.Count < 2) return BadRequest("Model text too short.");
+
+            // Parse objective line
+            var objParts = lines[0].Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+            if (objParts.Length < 2) return BadRequest("Invalid objective line.");
+
+            bool isMax = objParts[0].Equals("max", StringComparison.OrdinalIgnoreCase);
+            bool isMin = objParts[0].Equals("min", StringComparison.OrdinalIgnoreCase);
+            if (!isMax && !isMin) return BadRequest("Objective must start with 'max' or 'min'.");
+
+            var c = objParts.Skip(1)
+                            .Select(s => double.Parse(s, CultureInfo.InvariantCulture))
+                            .ToArray();
+            int n = c.Length;
+
+            // Detect constraints (supports <=, >=, = and Unicode ≤/≥)
+            var opAscii = new Regex(@"(<=|>=|=)\s*(-?\d+(?:\.\d+)?(?:[eE][\+\-]?\d+)?)");
+            var opUni = new Regex(@"(≤|≥|=)\s*(-?\d+(?:\.\d+)?(?:[eE][\+\-]?\d+)?)");
+
+            var constraintLines = new List<string>();
+            foreach (var ln in lines.Skip(1))
+            {
+                if (ln.StartsWith("#")) continue;
+
+                var toks = ln.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                bool looksRestrictions = toks.All(t =>
+                    t.Equals("bin", StringComparison.OrdinalIgnoreCase) ||
+                    t.Equals("int", StringComparison.OrdinalIgnoreCase) ||
+                    t.Equals("urs", StringComparison.OrdinalIgnoreCase) ||
+                    t == "+" || t == "-");
+                if (looksRestrictions) break;
+
+                if (opAscii.IsMatch(ln) || opUni.IsMatch(ln))
+                    constraintLines.Add(ln);
+            }
+
+            int m = constraintLines.Count;
+            if (m == 0) return BadRequest("No constraints detected.");
+
+            var A = new double[m, n];
+            var rhs = new double[m];
+            var sense = new string[m];
+
+            for (int i = 0; i < m; i++)
+            {
+                string ln = constraintLines[i];
+                var m1 = opAscii.Match(ln);
+                if (!m1.Success) m1 = opUni.Match(ln);
+                if (!m1.Success) return BadRequest($"Could not parse operator/RHS in: {ln}");
+
+                string opTok = m1.Groups[1].Value;
+                string rhsTok = m1.Groups[2].Value;
+                rhs[i] = double.Parse(rhsTok, CultureInfo.InvariantCulture);
+                sense[i] = opTok switch { "≤" => "<=", "≥" => ">=", _ => opTok };
+
+                var coeffText = ln.Substring(0, m1.Index).Trim();
+                var coeffs = coeffText.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+                if (coeffs.Length != n)
+                    return BadRequest($"Constraint {i} has {coeffs.Length} coeffs but objective has {n} variables.");
+
+                for (int j = 0; j < n; j++)
+                    A[i, j] = double.Parse(coeffs[j], CultureInfo.InvariantCulture);
+            }
+
+            // Only handle the standard dual-friendly forms for now:
+            bool allLe = sense.All(s => s == "<=");
+            bool allGe = sense.All(s => s == ">=");
+            if (!((isMax && allLe) || (isMin && allGe)))
+            {
+                return BadRequest(
+                    "Apply Duality currently supports:\n" +
+                    "• max with all constraints <= (x ≥ 0)\n" +
+                    "• min with all constraints >= (x ≥ 0)\n" +
+                    "Please convert to a supported standard form first."
+                );
+            }
+
+            // Build A^T
+            var At = new double[n, m];
+            for (int i = 0; i < m; i++)
+                for (int j = 0; j < n; j++)
+                    At[j, i] = A[i, j];
+
+            // --- Build dual model text ---
+            var sb = new StringBuilder();
+            if (isMax && allLe)
+            {
+                // Primal: max, Ax <= b, x >= 0  -> Dual: min, A^T y >= c, y >= 0
+                sb.Append("min ");
+                for (int i = 0; i < m; i++)
+                    sb.Append((i == 0 ? "" : " ") + rhs[i].ToString(CultureInfo.InvariantCulture));
+                sb.AppendLine();
+
+                for (int j = 0; j < n; j++)
+                {
+                    for (int i = 0; i < m; i++)
+                        sb.Append((i == 0 ? "" : " ") + At[j, i].ToString(CultureInfo.InvariantCulture));
+                    sb.Append(" >= ");
+                    sb.AppendLine(c[j].ToString(CultureInfo.InvariantCulture));
+                }
+
+                sb.AppendLine(string.Join(' ', Enumerable.Repeat("+", m)));  // y ≥ 0
+            }
+            else
+            {
+                // Primal: min, Ax >= b, x >= 0  -> Dual: max, A^T y <= c, y >= 0
+                sb.Append("max ");
+                for (int i = 0; i < m; i++)
+                    sb.Append((i == 0 ? "" : " ") + rhs[i].ToString(CultureInfo.InvariantCulture));
+                sb.AppendLine();
+
+                for (int j = 0; j < n; j++)
+                {
+                    for (int i = 0; i < m; i++)
+                        sb.Append((i == 0 ? "" : " ") + At[j, i].ToString(CultureInfo.InvariantCulture));
+                    sb.Append(" <= ");
+                    sb.AppendLine(c[j].ToString(CultureInfo.InvariantCulture));
+                }
+
+                sb.AppendLine(string.Join(' ', Enumerable.Repeat("+", m)));  // y ≥ 0
+            }
+
+            string dualText = sb.ToString();
+
+            // Solve dual with the correct flavor
+            var dualModel = ModelParser.Parse(dualText);
+            ISolver solver = (isMax && allLe) ? new DualSimplexSolver() : new DualSimplexSolver();
+
+            var result = solver.Solve(dualModel);
+
+
+            // Format like your normal solver output
+            var outText = new StringBuilder();
+            outText.AppendLine($"Algorithm: {solver.Name}");
+            if (result.Log != null)
+                foreach (var line in result.Log) outText.AppendLine(line);
+
+            if (result.Success)
+            {
+                outText.AppendLine();
+                var invert = result.ObjectiveValue * -1;
+                outText.AppendLine($"SUCCESS — Objective: {invert.ToString("0.###", CultureInfo.InvariantCulture)}");
+                if (result.X is { Length: > 0 })
+                {
+                    var sol = string.Join(", ", result.X.Select((v, i) =>
+                        $"y{i + 1}={(double.IsNaN(v) ? "NaN" : v.ToString("0.###", CultureInfo.InvariantCulture))}"));
+                    outText.AppendLine("Solution: " + sol);
+                }
+            }
+            else
+            {
+                outText.AppendLine(result.Unbounded ? "FAILED — Unbounded."
+                                 : result.Infeasible ? "FAILED — Infeasible."
+                                 : "FAILED — Unknown.");
+            }
+
+            // Add a strong-duality line if we have primal
+            if (_cache?.LastResult?.Success == true)
+            {
+                var primalZ = _cache.LastResult.ObjectiveValue;
+                var dualZ = result.ObjectiveValue *-1;
+                outText.AppendLine();
+                outText.AppendLine($"Duality Strength (LP): primal z = {primalZ:0.###}, dual = {dualZ:0.###} " +
+                                   (Math.Abs(primalZ - dualZ) < 1e-6 ? "This lp has a strong duality" : "This lp has a weak duality"));
+            }
+
+            // Show the dual model text at the very top for reference (optional — comment out if not desired)
+            var finalText =
+                "DUAL MODEL (auto-generated):\n" +
+                dualText +
+                "\n" +
+                outText.ToString();
+
+            return Content(finalText, "text/plain");
+        }
+
+
+
+
     }
 }
