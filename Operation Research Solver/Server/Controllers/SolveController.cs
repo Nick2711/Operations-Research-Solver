@@ -529,6 +529,138 @@ namespace Server.Controllers
             return Content(finalText, "text/plain");
         }
 
+        // ===================== RANGE OF RHS =====================
+        [HttpGet("rhs-ranges")]
+        public IActionResult GetRhsRanges()
+        {
+            if (_cache?.LastResult == null || !_cache.LastResult.Success)
+                return BadRequest("No solved model in memory.");
+
+            var sens = _cache.LastResult.Sensitivity;
+            if (sens == null)
+                return BadRequest("Sensitivity details missing. Solve with Primal Simplex.");
+
+            // B^{-1} and current basic variable values x_B (RHS of basic rows in the final tableau)
+            var BInv = sens.BInv;          // m x m
+            var xB = sens.b;             // length m (these are the current basic values)
+            var y = sens.ShadowPrices;  // duals (shadow prices), length m
+
+            int m = xB.Length;
+            if (BInv == null || BInv.GetLength(0) != m || BInv.GetLength(1) != m)
+                return BadRequest("Internal error: BInv shape mismatch.");
+
+            // Try to read the *current* RHS numbers from the cached model text for display (optional)
+            double[] rhsDisplay = new double[m];
+            for (int i = 0; i < m; i++) rhsDisplay[i] = double.NaN;
+
+            if (!string.IsNullOrWhiteSpace(_lastModelText))
+            {
+                var lines = _lastModelText.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None).ToList();
+                // Extract constraint lines by finding an operator; this matches what you used elsewhere
+                var opAscii = new Regex(@"(<=|>=|=)\s*(-?\d+(?:\.\d+)?(?:[eE][\+\-]?\d+)?)");
+                var opUni = new Regex(@"(≤|≥|=)\s*(-?\d+(?:\.\d+)?(?:[eE][\+\-]?\d+)?)");
+
+                var constraintIdxs = lines
+                    .Select((text, idx) => new { text, idx })
+                    .Where(t => !string.IsNullOrWhiteSpace(t.text) && !t.text.TrimStart().StartsWith("#"))
+                    .Where(t =>
+                    {
+                        var toks = t.text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                        bool looksRestr = toks.All(tok =>
+                            tok.Equals("bin", StringComparison.OrdinalIgnoreCase) ||
+                            tok.Equals("int", StringComparison.OrdinalIgnoreCase) ||
+                            tok.Equals("urs", StringComparison.OrdinalIgnoreCase) ||
+                            tok == "+" || tok == "-");
+                        return !looksRestr;
+                    })
+                    .Where(t => opAscii.IsMatch(t.text) || opUni.IsMatch(t.text))
+                    .Select(t => t.idx)
+                    .ToList();
+
+                for (int k = 0; k < Math.Min(m, constraintIdxs.Count); k++)
+                {
+                    string ln = lines[constraintIdxs[k]];
+                    var m1 = opAscii.Match(ln);
+                    if (!m1.Success) m1 = opUni.Match(ln);
+                    if (m1.Success && double.TryParse(m1.Groups[2].Value, NumberStyles.Any, CultureInfo.InvariantCulture, out var rhsVal))
+                        rhsDisplay[k] = rhsVal;
+                }
+            }
+
+            var inv = CultureInfo.InvariantCulture;
+            var results = new List<object>();
+
+            // For changing the k-th RHS by Δ: x_B(new) = x_B + Δ * (column k of B^{-1})
+            // Keep feasibility: x_Bj + Δ * w_j >= 0 for all j, where w_j = (B^{-1})_{j,k}
+            // => Δ >= max_{w_j>0} (-x_Bj / w_j)   and   Δ <= min_{w_j<0} (-x_Bj / w_j)
+            for (int k = 0; k < m; k++)
+            {
+                double low = double.NegativeInfinity; // lower bound for Δ
+                double high = double.PositiveInfinity; // upper bound for Δ
+
+                for (int j = 0; j < m; j++)
+                {
+                    double w = BInv[j, k];
+                    if (Math.Abs(w) < 1e-12) continue;
+
+                    double bound = -xB[j] / w;
+                    if (w > 0)
+                    {
+                        // Δ >= bound
+                        if (bound > low) low = bound;
+                    }
+                    else // w < 0
+                    {
+                        // Δ <= bound
+                        if (bound < high) high = bound;
+                    }
+                }
+
+                // Convert to nonnegative "allowable decrease/increase" magnitudes
+                string decOut, incOut;
+
+                if (double.IsNegativeInfinity(low))
+                {
+                    // No positive w_j: decreasing RHS has no lower limit
+                    decOut = "unbounded";
+                }
+                else
+                {
+                    // decrease means Δ negative; magnitude is max(0, -low)
+                    double dec = Math.Max(0.0, -low);
+                    decOut = dec.ToString("0.###", inv);
+                }
+
+                if (double.IsPositiveInfinity(high))
+                {
+                    // No negative w_j: increasing RHS has no upper limit
+                    incOut = "unbounded";
+                }
+                else
+                {
+                    // increase means Δ positive; magnitude is max(0, high)
+                    double inc = Math.Max(0.0, high);
+                    incOut = inc.ToString("0.###", inv);
+                }
+
+                // Shadow price is finite; keep as number
+                double sp = (k >= 0 && k < y.Length) ? y[k] : double.NaN;
+
+                results.Add(new
+                {
+                    Constraint = $"c{k + 1}",
+                    RHS = rhsDisplay[k],                   // purely for display
+                    ShadowPrice = Math.Round(sp, 6),       // numeric (finite)
+                    AllowableDecrease = decOut,            // strings (no Infinity in JSON)
+                    AllowableIncrease = incOut
+                });
+            }
+
+            return Ok(new { success = true, output = results });
+        }
+
+
+
 
 
 
