@@ -31,14 +31,6 @@ namespace OperationResearchSolver.Server.Controllers
             return Ok(an.ShadowPrices());
         }
 
-        [HttpGet("reduced-costs")]
-        public IActionResult ReducedCosts()
-        {
-            var an = Analyzer();
-            if (an == null) return NotFound("No solved model in memory.");
-            return Ok(an.ReducedCosts());
-        }
-
         [HttpGet("rhs-ranges")]
         public IActionResult RhsRanges()
         {

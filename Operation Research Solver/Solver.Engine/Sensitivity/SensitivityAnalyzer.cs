@@ -24,6 +24,9 @@ namespace Solver.Engine.Sensitivity
             var dict = new Dictionary<int, double>();
             for (int i = 0; i < y.Length; i++) dict[i] = y[i]; // key = constraint index
             return dict;
+
+
+
         }
 
         public Dictionary<int, double> ReducedCosts()
