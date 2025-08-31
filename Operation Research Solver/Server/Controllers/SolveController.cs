@@ -13,7 +13,6 @@ using Solver.Engine.Integer;
 using Solver.Engine.CuttingPlanes;
 using System.Text.RegularExpressions;
 
-
 namespace Server.Controllers
 {
     [ApiController]
@@ -26,7 +25,6 @@ namespace Server.Controllers
         public SolveController(ILastSolveCache cache) => _cache = cache;
 
         // ===================== MAIN SOLVE =====================
-        // This is the ONLY action that handles POST /api/solve
         [HttpPost]
         public ActionResult<SolveResponse> Post([FromBody] SolveRequest req, CancellationToken ct)
         {
@@ -80,7 +78,7 @@ namespace Server.Controllers
 
                 var result = solver.Solve(model);
 
-                // ✅ Cache results for sensitivity + remember raw text
+                // cache
                 _cache.LastResult = result;
                 _lastModelText = req.ModelText;
 
@@ -167,23 +165,18 @@ namespace Server.Controllers
         // ===================== CHANGE RHS (re-solve) =====================
         public record ChangeRhsRequest(int ConstraintIndex, double NewRhs);
 
-        // POST /api/solve/change-rhs
         [HttpPost("change-rhs")]
         public IActionResult ChangeRhs([FromBody] ChangeRhsRequest req)
         {
-            // lines: 0 objective, ... constraints ..., last = variable restrictions
             var rawLines = _lastModelText.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None).ToList();
             if (rawLines.Count < 2) return BadRequest("Model text too short.");
 
-            // Build a list of actual constraint lines by detecting an operator (<=, >=, =, ≤, ≥)
             var opRegexAscii = new Regex(@"(<=|>=|=)\s*(-?\d+(?:\.\d+)?(?:[eE][\+\-]?\d+)?)");
             var opRegexUnicode = new Regex(@"(≤|≥|=)\s*(-?\d+(?:\.\d+)?(?:[eE][\+\-]?\d+)?)");
 
             var constraintLineIndices = rawLines
                 .Select((text, idx) => new { text, idx })
-                // skip empty lines and comments
                 .Where(t => !string.IsNullOrWhiteSpace(t.text) && !t.text.TrimStart().StartsWith("#"))
-                // exclude the last non-empty line if it's variable restrictions (all tokens are words like bin/int/urs/+/-)
                 .Where(t =>
                 {
                     var tokens = t.text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
@@ -194,7 +187,6 @@ namespace Server.Controllers
                         tok == "+" || tok == "-");
                     return !looksLikeRestrictions;
                 })
-                // keep lines that have an operator + RHS number
                 .Where(t => opRegexAscii.IsMatch(t.text) || opRegexUnicode.IsMatch(t.text))
                 .Select(t => t.idx)
                 .ToList();
@@ -205,22 +197,18 @@ namespace Server.Controllers
             if (req.ConstraintIndex < 0 || req.ConstraintIndex >= constraintLineIndices.Count)
                 return BadRequest($"Constraint index out of range. Found {constraintLineIndices.Count} constraint(s), 0-based.");
 
-            // Pick the requested constraint line by index into the detected list
             int lineIdx = constraintLineIndices[req.ConstraintIndex];
             string line = rawLines[lineIdx];
 
-            // Find the operator+RHS on that line
             var m = opRegexAscii.Match(line);
             if (!m.Success) m = opRegexUnicode.Match(line);
             if (!m.Success)
                 return BadRequest($"Could not find operator/RHS on constraint line:\n{line}");
 
-            // Preserve whether there was a space between operator and number
-            string opToken = m.Groups[1].Value;  // "<=", ">=", "=", "≤", "≥"
+            string opToken = m.Groups[1].Value;
             bool hadSpace = m.Value.Contains(" ");
             string newRhsStr = req.NewRhs.ToString(CultureInfo.InvariantCulture);
 
-            // Replace only the matched operator+number segment
             line = line.Remove(m.Index, m.Length)
                        .Insert(m.Index, hadSpace ? $"{opToken} {newRhsStr}" : $"{opToken}{newRhsStr}");
 
@@ -228,12 +216,10 @@ namespace Server.Controllers
 
             var newText = string.Join("\n", rawLines);
 
-            // Re-solve with Primal Simplex (or pick based on last request if you wish)
             var model = ModelParser.Parse(newText);
             ISolver solver = new PrimalSimplexSolver();
             var result = solver.Solve(model);
 
-            // Update cache for subsequent actions
             _lastModelText = newText;
             _cache.LastResult = result;
 
@@ -241,7 +227,6 @@ namespace Server.Controllers
                          $"\n\nThe new objective value is: {result.ObjectiveValue:0.####}";
 
             return Content(output, "text/plain");
-
         }
 
         // ===================== ADD CONSTRAINT (re-solve) =====================
@@ -256,47 +241,39 @@ namespace Server.Controllers
             if (string.IsNullOrWhiteSpace(req.ConstraintText))
                 return BadRequest("Constraint text is empty.");
 
-            // Split cached model into lines
             var lines = _lastModelText.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None).ToList();
             if (lines.Count < 2) return BadRequest("Model text too short.");
 
             var objLine = lines[0].Trim();
             var objParts = objLine.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
             if (objParts.Length < 2) return BadRequest("Objective line invalid.");
-            int numVars = objParts.Length - 1;  // first token = max/min, rest are coeffs
+            int numVars = objParts.Length - 1;
 
-            // Parse new constraint text: "<coeffs...> <op> <rhs>" (supports <=, >=, = and ≤/≥; space optional before RHS)
             var raw = req.ConstraintText.Trim();
             if (raw.StartsWith("#")) return BadRequest("Constraint cannot be a comment.");
 
-            // Find operator and rhs with regex
             var m = Regex.Match(raw, @"(<=|>=|=)\s*(-?\d+(?:\.\d+)?(?:[eE][\+\-]?\d+)?)");
             if (!m.Success) m = Regex.Match(raw, @"(≤|≥|=)\s*(-?\d+(?:\.\d+)?(?:[eE][\+\-]?\d+)?)");
             if (!m.Success) return BadRequest("Could not find operator/RHS in the new constraint.");
 
-            string opToken = m.Groups[1].Value;  // "<=", ">=", "=", "≤", "≥"
+            string opToken = m.Groups[1].Value;
             string rhsText = m.Groups[2].Value;
 
-            // Coeffs are everything before the operator match
             string coeffsRegion = raw.Substring(0, m.Index).Trim();
             var coeffTokens = coeffsRegion.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
 
             if (coeffTokens.Length != numVars)
                 return BadRequest($"Expected {numVars} coefficients but found {coeffTokens.Length}.");
 
-            // Validate coefficients are numbers
             foreach (var t in coeffTokens)
                 if (!double.TryParse(t, NumberStyles.Any, CultureInfo.InvariantCulture, out _))
                     return BadRequest($"Coefficient '{t}' is not a number.");
 
-            // Validate RHS
             if (!double.TryParse(rhsText, NumberStyles.Any, CultureInfo.InvariantCulture, out _))
                 return BadRequest($"RHS '{rhsText}' is not a number.");
 
-            // Normalize the new constraint line: keep tokens as given; ensure a space before RHS
             var normalizedConstraint = $"{string.Join(' ', coeffTokens)} {opToken} {rhsText}";
 
-            // Find the variable restrictions line (last non-empty line with only bin/int/urs/+/- tokens)
             int restrictionsIdx = -1;
             for (int i = lines.Count - 1; i >= 0; i--)
             {
@@ -320,17 +297,14 @@ namespace Server.Controllers
             if (restrictionsIdx == -1)
                 return BadRequest("Could not locate variable restrictions line to insert before.");
 
-            // Insert the new constraint right before restrictions
             lines.Insert(restrictionsIdx, normalizedConstraint);
 
             var newText = string.Join("\n", lines);
 
-            // Re-solve
             var model = ModelParser.Parse(newText);
             ISolver solver = new PrimalSimplexSolver();
             var result = solver.Solve(model);
 
-            // Update cache
             _lastModelText = newText;
             _cache.LastResult = result;
 
@@ -340,7 +314,7 @@ namespace Server.Controllers
             return Content(output, "text/plain");
         }
 
-        // ===================== APPLY DUALITY (build dual, solve, text output) =====================
+        // ===================== APPLY DUALITY =====================
         public record ApplyDualityResponse(string DualModelText, string OutputText, string Summary);
 
         [HttpPost("apply-duality")]
@@ -355,7 +329,6 @@ namespace Server.Controllers
                                       .ToList();
             if (lines.Count < 2) return BadRequest("Model text too short.");
 
-            // Parse objective line
             var objParts = lines[0].Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
             if (objParts.Length < 2) return BadRequest("Invalid objective line.");
 
@@ -368,7 +341,6 @@ namespace Server.Controllers
                             .ToArray();
             int n = c.Length;
 
-            // Detect constraints (supports <=, >=, = and Unicode ≤/≥)
             var opAscii = new Regex(@"(<=|>=|=)\s*(-?\d+(?:\.\d+)?(?:[eE][\+\-]?\d+)?)");
             var opUni = new Regex(@"(≤|≥|=)\s*(-?\d+(?:\.\d+)?(?:[eE][\+\-]?\d+)?)");
 
@@ -417,7 +389,6 @@ namespace Server.Controllers
                     A[i, j] = double.Parse(coeffs[j], CultureInfo.InvariantCulture);
             }
 
-            // Only handle the standard dual-friendly forms for now:
             bool allLe = sense.All(s => s == "<=");
             bool allGe = sense.All(s => s == ">=");
             if (!((isMax && allLe) || (isMin && allGe)))
@@ -430,17 +401,14 @@ namespace Server.Controllers
                 );
             }
 
-            // Build A^T
             var At = new double[n, m];
             for (int i = 0; i < m; i++)
                 for (int j = 0; j < n; j++)
                     At[j, i] = A[i, j];
 
-            // --- Build dual model text ---
             var sb = new StringBuilder();
             if (isMax && allLe)
             {
-                // Primal: max, Ax <= b, x >= 0  -> Dual: min, A^T y >= c, y >= 0
                 sb.Append("min ");
                 for (int i = 0; i < m; i++)
                     sb.Append((i == 0 ? "" : " ") + rhs[i].ToString(CultureInfo.InvariantCulture));
@@ -458,7 +426,6 @@ namespace Server.Controllers
             }
             else
             {
-                // Primal: min, Ax >= b, x >= 0  -> Dual: max, A^T y <= c, y >= 0
                 sb.Append("max ");
                 for (int i = 0; i < m; i++)
                     sb.Append((i == 0 ? "" : " ") + rhs[i].ToString(CultureInfo.InvariantCulture));
@@ -477,14 +444,11 @@ namespace Server.Controllers
 
             string dualText = sb.ToString();
 
-            // Solve dual with the correct flavor
             var dualModel = ModelParser.Parse(dualText);
             ISolver solver = (isMax && allLe) ? new DualSimplexSolver() : new DualSimplexSolver();
 
             var result = solver.Solve(dualModel);
 
-
-            // Format like your normal solver output
             var outText = new StringBuilder();
             outText.AppendLine($"Algorithm: {solver.Name}");
             if (result.Log != null)
@@ -509,17 +473,15 @@ namespace Server.Controllers
                                  : "FAILED — Unknown.");
             }
 
-            // Add a strong-duality line if we have primal
             if (_cache?.LastResult?.Success == true)
             {
                 var primalZ = _cache.LastResult.ObjectiveValue;
-                var dualZ = result.ObjectiveValue *-1;
+                var dualZ = result.ObjectiveValue * -1;
                 outText.AppendLine();
                 outText.AppendLine($"Duality Strength (LP): primal z = {primalZ:0.###}, dual = {dualZ:0.###} " +
                                    (Math.Abs(primalZ - dualZ) < 1e-6 ? "This lp has a strong duality" : "This lp has a weak duality"));
             }
 
-            // Show the dual model text at the very top for reference (optional — comment out if not desired)
             var finalText =
                 "DUAL MODEL (auto-generated):\n" +
                 dualText +
@@ -530,7 +492,7 @@ namespace Server.Controllers
         }
 
         // ===================== RANGE OF RHS =====================
-        [HttpGet("rhs-ranges")]
+        /*[HttpGet("rhs-ranges")]
         public IActionResult GetRhsRanges()
         {
             if (_cache?.LastResult == null || !_cache.LastResult.Success)
@@ -540,23 +502,21 @@ namespace Server.Controllers
             if (sens == null)
                 return BadRequest("Sensitivity details missing. Solve with Primal Simplex.");
 
-            // B^{-1} and current basic variable values x_B (RHS of basic rows in the final tableau)
             var BInv = sens.BInv;          // m x m
-            var xB = sens.b;             // length m (these are the current basic values)
-            var y = sens.ShadowPrices;  // duals (shadow prices), length m
+            var xB = sens.b;               // length m (basic RHS)
+            var y = sens.ShadowPrices;     // duals
 
             int m = xB.Length;
             if (BInv == null || BInv.GetLength(0) != m || BInv.GetLength(1) != m)
                 return BadRequest("Internal error: BInv shape mismatch.");
 
-            // Try to read the *current* RHS numbers from the cached model text for display (optional)
+            // Try to read current RHS numbers from cached model text for display
             double[] rhsDisplay = new double[m];
             for (int i = 0; i < m; i++) rhsDisplay[i] = double.NaN;
 
             if (!string.IsNullOrWhiteSpace(_lastModelText))
             {
                 var lines = _lastModelText.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None).ToList();
-                // Extract constraint lines by finding an operator; this matches what you used elsewhere
                 var opAscii = new Regex(@"(<=|>=|=)\s*(-?\d+(?:\.\d+)?(?:[eE][\+\-]?\d+)?)");
                 var opUni = new Regex(@"(≤|≥|=)\s*(-?\d+(?:\.\d+)?(?:[eE][\+\-]?\d+)?)");
 
@@ -590,9 +550,6 @@ namespace Server.Controllers
             var inv = CultureInfo.InvariantCulture;
             var results = new List<object>();
 
-            // For changing the k-th RHS by Δ: x_B(new) = x_B + Δ * (column k of B^{-1})
-            // Keep feasibility: x_Bj + Δ * w_j >= 0 for all j, where w_j = (B^{-1})_{j,k}
-            // => Δ >= max_{w_j>0} (-x_Bj / w_j)   and   Δ <= min_{w_j<0} (-x_Bj / w_j)
             for (int k = 0; k < m; k++)
             {
                 double low = double.NegativeInfinity; // lower bound for Δ
@@ -606,63 +563,44 @@ namespace Server.Controllers
                     double bound = -xB[j] / w;
                     if (w > 0)
                     {
-                        // Δ >= bound
-                        if (bound > low) low = bound;
+                        if (bound > low) low = bound;   // Δ >= bound
                     }
-                    else // w < 0
+                    else
                     {
-                        // Δ <= bound
-                        if (bound < high) high = bound;
+                        if (bound < high) high = bound; // Δ <= bound
                     }
                 }
 
-                // Convert to nonnegative "allowable decrease/increase" magnitudes
-                string decOut, incOut;
+                // Convert to strings (no Infinity/NaN in JSON)
+                string decOut = double.IsNegativeInfinity(low)
+                    ? "unbounded"
+                    : Math.Max(0.0, -low).ToString("0.###", inv);
 
-                if (double.IsNegativeInfinity(low))
-                {
-                    // No positive w_j: decreasing RHS has no lower limit
-                    decOut = "unbounded";
-                }
-                else
-                {
-                    // decrease means Δ negative; magnitude is max(0, -low)
-                    double dec = Math.Max(0.0, -low);
-                    decOut = dec.ToString("0.###", inv);
-                }
+                string incOut = double.IsPositiveInfinity(high)
+                    ? "unbounded"
+                    : Math.Max(0.0, high).ToString("0.###", inv);
 
-                if (double.IsPositiveInfinity(high))
-                {
-                    // No negative w_j: increasing RHS has no upper limit
-                    incOut = "unbounded";
-                }
-                else
-                {
-                    // increase means Δ positive; magnitude is max(0, high)
-                    double inc = Math.Max(0.0, high);
-                    incOut = inc.ToString("0.###", inv);
-                }
+                // Ensure RHS and ShadowPrice are JSON-safe numbers or null
+                double? rhsOut = (double.IsNaN(rhsDisplay[k]) || double.IsInfinity(rhsDisplay[k]))
+                    ? (double?)null
+                    : rhsDisplay[k];
 
-                // Shadow price is finite; keep as number
-                double sp = (k >= 0 && k < y.Length) ? y[k] : double.NaN;
+                double spRaw = (k >= 0 && k < y.Length) ? y[k] : double.NaN;
+                double? spOut = (double.IsNaN(spRaw) || double.IsInfinity(spRaw))
+                    ? (double?)null
+                    : Math.Round(spRaw, 6);
 
                 results.Add(new
                 {
                     Constraint = $"c{k + 1}",
-                    RHS = rhsDisplay[k],                   // purely for display
-                    ShadowPrice = Math.Round(sp, 6),       // numeric (finite)
-                    AllowableDecrease = decOut,            // strings (no Infinity in JSON)
+                    RHS = rhsOut,                 // null if not available
+                    ShadowPrice = spOut,          // null if NaN/∞
+                    AllowableDecrease = decOut,   // strings: numbers or "unbounded"
                     AllowableIncrease = incOut
                 });
             }
 
             return Ok(new { success = true, output = results });
-        }
-
-
-
-
-
-
+        }*/
     }
 }

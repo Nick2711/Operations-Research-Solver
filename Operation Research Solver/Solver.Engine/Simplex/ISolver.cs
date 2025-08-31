@@ -63,34 +63,39 @@ namespace Solver.Engine.Simplex
     }
 }*/
 
-using Solver.Engine.Core; // ❗ add this at the top so the type is visible
+using Solver.Engine.Core;
 
-namespace Solver.Engine.Simplex;
-
-public interface ISolver
+namespace Solver.Engine.Simplex
 {
-    string Name { get; }
-    SolverResult Solve(LpModel model);
-}
-
-public sealed class SolverResult
-{
-    public bool Success { get; }
-    public bool Unbounded { get; }
-    public bool Infeasible { get; }
-    public double ObjectiveValue { get; }
-    public double[] X { get; }
-    public List<string> Log { get; }
-
-    // ❗ NEW: stash everything we need for sensitivity
-    public SensitivityPayload? Sensitivity { get; init; }
-
-    public SolverResult(bool success, double z, double[] x, List<string>? log = null,
-                        bool unbounded = false, bool infeasible = false)
+    public interface ISolver
     {
-        Success = success; ObjectiveValue = z; X = x;
-        Unbounded = unbounded; Infeasible = infeasible;
-        Log = log ?? new();
+        string Name { get; }
+        SolverResult Solve(LpModel model);
+    }
+
+    public sealed class SolverResult
+    {
+        public bool Success { get; }
+        public bool Unbounded { get; }
+        public bool Infeasible { get; }
+        public double ObjectiveValue { get; }
+        public double[] X { get; }
+        public List<string> Log { get; }
+
+        // Sensitivity payload (not serialized in responses; used server-side only)
+        public SensitivityPayload? Sensitivity { get; init; }
+
+        public SolverResult(bool success, double z, double[] x, List<string>? log = null,
+                            bool unbounded = false, bool infeasible = false)
+        {
+            Success = success;
+            ObjectiveValue = z;
+            X = x;
+            Unbounded = unbounded;
+            Infeasible = infeasible;
+            Log = log ?? new();
+        }
     }
 }
+
 

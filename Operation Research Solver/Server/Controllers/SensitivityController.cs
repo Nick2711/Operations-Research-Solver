@@ -23,7 +23,7 @@ namespace OperationResearchSolver.Server.Controllers
             return new SensitivityAnalyzer(payload);
         }
 
-        [HttpGet("shadow-prices")]
+        /*[HttpGet("shadow-prices")]
         public IActionResult ShadowPrices()
         {
             var an = Analyzer();
@@ -46,7 +46,7 @@ namespace OperationResearchSolver.Server.Controllers
               });
             return Ok(items);
 
-        }
+        }*/
 
     }
 }

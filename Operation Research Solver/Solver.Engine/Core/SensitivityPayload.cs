@@ -7,10 +7,10 @@
         public double[,] N { get; }
         public double[] cB { get; }
         public double[] cN { get; }
-        public double[] b { get; }         // RHS of constraints (canonical)
+        public double[] b { get; }         // basic values (current RHS for basic rows)
         public int[] Basis { get; }
         public int[] Nonbasic { get; }
-        public double[] ShadowPrices { get; }  // y
+        public double[] ShadowPrices { get; }  // y = cB^T B^{-1}
 
         public SensitivityPayload(
             double[,] B,
