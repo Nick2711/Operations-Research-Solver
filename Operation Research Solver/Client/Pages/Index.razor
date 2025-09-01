@@ -1,9 +1,10 @@
 ﻿@page "/"
 @using Shared.Models
 @using Microsoft.AspNetCore.Components.Forms
-@using System.Net.Http.Json
 @inject HttpClient Http
 @inject IJSRuntime JS
+@using Shared.Models
+@using System.Globalization
 
 <div class="container mx-auto px-4 py-8 max-w-6xl">
     <!-- Header Section -->
@@ -15,370 +16,247 @@
     </header>
 
     <div class="bg-white rounded-xl shadow-lg overflow-hidden">
-        <!-- Tabs (pure Blazor) -->
+        <!-- Tabs Navigation -->
         <div class="flex border-b border-gray-200">
-            <button class="@TabBtnClass(Tab.Upload)" @onclick="@(() => SetTab(Tab.Upload))">
+            <button class="tab-btn py-4 px-6 font-medium text-gray-500 hover:text-blue-600 focus:outline-none border-b-2 border-transparent hover:border-blue-300 active" data-tab="upload">
                 <i class="fas fa-upload mr-2"></i>Model Upload
             </button>
-            <button class="@TabBtnClass(Tab.Solve)" @onclick="@(() => SetTab(Tab.Solve))">
+            <button class="tab-btn py-4 px-6 font-medium text-gray-500 hover:text-blue-600 focus:outline-none border-b-2 border-transparent hover:border-blue-300" data-tab="solve">
                 <i class="fas fa-calculator mr-2"></i>Solve Model
             </button>
-            <button class="@TabBtnClass(Tab.Analysis)" @onclick="@(() => SetTab(Tab.Analysis))">
+            <button class="tab-btn py-4 px-6 font-medium text-gray-500 hover:text-blue-600 focus:outline-none border-b-2 border-transparent hover:border-blue-300" data-tab="analysis">
                 <i class="fas fa-chart-line mr-2"></i>Sensitivity Analysis
             </button>
         </div>
 
         <!-- Tab Contents -->
         <div class="p-6">
-            @if (ActiveTab == Tab.Upload)
-            {
-                <!-- Upload Tab -->
-                <div>
-                    <div class="mb-8">
-                        <h2 class="text-2xl font-semibold text-gray-800 mb-4">Upload Your Model</h2>
-                        <p class="text-gray-600 mb-6">
-                            Upload a .txt file containing your LP/IP model in the specified format. See example below.
-                        </p>
+            <!-- Upload Tab -->
+            <div id="upload" class="tab-content active">
+                <div class="mb-8">
+                    <h2 class="text-2xl font-semibold text-gray-800 mb-4">Upload Your Model</h2>
+                    <p class="text-gray-600 mb-6">
+                        Upload a .txt file containing your LP/IP model in the specified format. See example below.
+                    </p>
 
-                        <div class="flex flex-col md:flex-row gap-8">
-                            <div class="flex-1">
-                                <div class="border-2 border-dashed border-gray-300 rounded-lg p-6 text-center">
-                                    <label class="cursor-pointer select-none">
-                                        <div class="flex flex-col items-center justify-center">
-                                            <i class="fas fa-cloud-upload-alt text-5xl text-blue-500 mb-4"></i>
-                                            <h3 class="text-lg font-medium text-gray-700 mb-2">Click to upload or drag and drop</h3>
-                                            <p class="text-sm text-gray-500 mb-4">.txt files only</p>
-                                            <span class="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition">Select File</span>
-                                        </div>
-                                        <InputFile class="hidden" accept=".txt" OnChange="HandleFile" />
-                                    </label>
-                                </div>
+                    <div class="flex flex-col md:flex-row gap-8">
+                        <div class="flex-1">
+                            <div class="border-2 border-dashed border-gray-300 rounded-lg p-6 text-center">
+                                <label for="modelFile" class="file-input-label cursor-pointer">
+                                    <div class="flex flex-col items-center justify-center">
+                                        <i class="fas fa-cloud-upload-alt text-5xl text-blue-500 mb-4"></i>
+                                        <h3 class="text-lg font-medium text-gray-700 mb-2">Click to upload or drag and drop</h3>
+                                        <p class="text-sm text-gray-500 mb-4">.txt files only</p>
+                                        <span class="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition">Select File</span>
+                                    </div>
+                                    <!-- Hidden input stays visually identical; now Blazor can read the file -->
+                                    <InputFile id="modelFile" class="hidden" accept=".txt" OnChange="HandleFile" />
+                                </label>
+                            </div>
+                            <div id="fileInfo" class="mt-4 text-sm text-gray-600 hidden">
+                                <i class="fas fa-check-circle text-green-500 mr-2"></i>
+                                <span id="fileName">example.txt</span> selected
+                            </div>
+                        </div>
 
-                                <div class="mt-4 text-sm text-gray-600 @(string.IsNullOrWhiteSpace(_modelText) ? "hidden" : "")">
-                                    <i class="fas fa-check-circle text-green-500 mr-2"></i>
-                                    <span>Model file loaded.</span>
-                                </div>
+                        @* example block *@
+                        <div class="flex-1">
+                            <h3 class="text-lg font-medium text-gray-800 mb-3">File Format Example</h3>
+                            <div class="bg-gray-100 p-4 rounded-lg font-mono text-sm">
+                                <div class="text-blue-600 font-semibold mb-1"># Objective function (max/min and coefficients)</div>
+                                <div class="ml-4 mb-3">max +2 +3 +3 +5 +2 +4</div>
+
+                                <div class="text-blue-600 font-semibold mb-1"># Constraints (one per line)</div>
+                                <div class="ml-4 mb-3">+11 +8 +6 +14 +10 +10 &lt;= 40</div>
+                                <div class="ml-4 mb-3">+5 +2 +9 +0 +7 +3 &lt;= 25 <span class="text-gray-500 ml-2"># Optional additional constraints</span></div>
+
+                                <div class="text-blue-600 font-semibold mb-1"># Variable restrictions (last line)</div>
+                                <div class="ml-4">bin bin bin bin bin bin</div>
                             </div>
 
-                            <div class="flex-1">
-                                <h3 class="text-lg font-medium text-gray-800 mb-3">File Format Example</h3>
-                                <div class="bg-gray-100 p-4 rounded-lg font-mono text-sm">
-                                    <div class="text-blue-600 font-semibold mb-1"># Objective function (max/min and coefficients)</div>
-                                    <div class="ml-4 mb-3">max +2 +3 +3 +5 +2 +4</div>
+                            <div class="mt-4 text-sm text-gray-600">
+                                <p class="mb-2"><span class="font-medium">Format Rules:</span></p>
+                                <ul class="list-disc pl-5 space-y-1">
+                                    <li>First line: Problem type (<code>max</code>/<code>min</code>) and objective coefficients</li>
+                                    <li>Middle lines: Constraints (coefficients, operator <code> &lt;=</code> <code>=</code> <code>&gt;=</code>, RHS)</li>
+                                    <li>Last line: Variable restrictions (<code>+</code>, <code>-</code>, <code>int</code>, <code>bin</code>, <code>urs</code>)</li>
+                                    <li>Separate all values with spaces</li>
+                                    <li>Comments can be added with <code>#</code></li>
+                                </ul>
+                            </div>
+                        </div>
+                    </div>
+                </div>
 
-                                    <div class="text-blue-600 font-semibold mb-1"># Constraints (one per line)</div>
-                                    <div class="ml-4 mb-3">+11 +8 +6 +14 +10 +10 &lt;= 40</div>
-                                    <div class="ml-4 mb-3">+5 +2 +9 +0 +7 +3 &lt;= 25 <span class="text-gray-500 ml-2"># Optional additional constraints</span></div>
+                <div id="filePreviewSection" class="hidden">
+                    <h3 class="text-xl font-semibold text-gray-800 mb-3">File Preview</h3>
+                    <div class="bg-gray-50 border border-gray-200 rounded-lg p-4">
+                        <pre id="filePreview" class="text-sm">@(_modelText)</pre>
+                    </div>
+                </div>
+            </div>
 
-                                    <div class="text-blue-600 font-semibold mb-1"># Variable restrictions (last line)</div>
-                                    <div class="ml-4">bin bin bin bin bin bin</div>
-                                </div>
+            <!-- Solve Tab -->
+            <div id="solve" class="tab-content">
+                <h2 class="text-2xl font-semibold text-gray-800 mb-6">Solve Model</h2>
 
-                                <div class="mt-4 text-sm text-gray-600">
-                                    <p class="mb-2"><span class="font-medium">Format Rules:</span></p>
-                                    <ul class="list-disc pl-5 space-y-1">
-                                        <li>First line: Problem type (<code>max</code>/<code>min</code>) and objective coefficients</li>
-                                        <li>Middle lines: Constraints (coefficients, operator <code>&lt;=</code> <code>=</code> <code>&gt;=</code>, RHS)</li>
-                                        <li>Last line: Variable restrictions (<code>+</code>, <code>-</code>, <code>int</code>, <code>bin</code>, <code>urs</code>)</li>
-                                        <li>Separate all values with spaces</li>
-                                        <li>Comments can be added with <code>#</code></li>
-                                    </ul>
-                                </div>
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+                    <div class="md:col-span-2">
+                        <div class="bg-gray-50 p-4 rounded-lg border border-gray-200">
+                            <h3 class="text-lg font-medium text-gray-800 mb-3">Model Summary</h3>
+                            <div id="modelSummary" class="text-sm text-gray-700">
+                                No model loaded. Please upload a file in the Upload section.
                             </div>
                         </div>
                     </div>
 
-                    @if (!string.IsNullOrWhiteSpace(_modelText))
-                    {
-                        <div class="space-y-6">
-                            <div>
-                                <h3 class="text-xl font-semibold text-gray-800 mb-3">File Preview</h3>
-                                <div class="bg-gray-50 border border-gray-200 rounded-lg p-4">
-                                    <pre class="text-sm whitespace-pre-wrap break-words">@_modelText</pre>
-                                </div>
+                    <div>
+                        <div class="bg-gray-50 p-4 rounded-lg border border-gray-200">
+                            <h3 class="text-lg font-medium text-gray-800 mb-3">Algorithm Selection</h3>
+                            <div class="mb-4">
+                                <label for="algorithm" class="block text-sm font-medium text-gray-700 mb-1">Choose solving method:</label>
+                                <InputSelect id="algorithm"
+                                             class="w-full border rounded px-2 py-1"
+                                             @bind-Value="request.Algorithm"
+                                             TValue="Algorithm">
+                                    <option value="@Algorithm.PrimalSimplex">Primal Simplex</option>
+                                    <option value="@Algorithm.RevisedSimplex">Revised Simplex</option>
+                                    <option value="@Algorithm.BranchAndBound">Branch &amp; Bound</option>
+                                    <option value="@Algorithm.Knapsack01">Knapsack</option>
+                                    <option value="@Algorithm.CuttingPlane">Cutting Plane</option>
+                                </InputSelect>
                             </div>
+                            <button id="runSolverBtn" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-4 rounded-md transition flex items-center justify-center"
+                                    @onclick="RunSolver">
+                                <i class="fas fa-play-circle mr-2"></i> Run Solver
+                            </button>
+                        </div>
+                    </div>
+                </div>
 
-                            @if (parsedVarCount > 0)
+                <div class="mb-8">
+                    <h3 class="text-xl font-semibold text-gray-800 mb-3">Solution Output</h3>
+                    <div class="output-container bg-gray-50 border border-gray-200 rounded-lg p-4">
+                        <div id="solverOutput" class="text-sm font-mono">
+                            @if (string.IsNullOrWhiteSpace(_output))
                             {
-                                <div class="bg-indigo-50 border border-indigo-200 rounded-lg p-4">
-                                    <h4 class="text-indigo-800 font-semibold mb-2">Detected Model Structure</h4>
-                                    <div class="text-slate-700 text-sm grid grid-cols-1 md:grid-cols-3 gap-3">
-                                        <div><span class="font-medium">Decision variables:</span> @parsedVarCount</div>
-                                        <div><span class="font-medium">Constraints:</span> @parsedConstrCount</div>
-                                        <div><span class="font-medium">Objective:</span> @((parsedIsMax ? "Maximize" : "Minimize"))</div>
-                                    </div>
-
-                                    @if (parsedRestrictions.Count > 0)
-                                    {
-                                        <div class="mt-3">
-                                            <div class="text-xs uppercase tracking-wide text-slate-500 mb-1">Sign & type restrictions</div>
-                                            <div class="flex flex-wrap gap-2">
-                                                @for (int i = 0; i < parsedRestrictions.Count; i++)
-                                                {
-                                                    <span class="@RestrictionPillClass(parsedRestrictions[i])">
-                                                        x@(i + 1): @HumanRestriction(parsedRestrictions[i])
-                                                    </span>
-                                                }
-                                            </div>
-                                        </div>
-                                    }
-                                </div>
+                                <p class="text-gray-500 italic">Solution output will appear here after running the solver.</p>
+                            }
+                            else
+                            {
+                                <pre>@_output</pre>
                             }
                         </div>
-                    }
+                    </div>
                 </div>
-            }
-            else if (ActiveTab == Tab.Solve)
-            {
-                <!-- Solve Tab -->
-                <div>
-                    <h2 class="text-2xl font-semibold text-gray-800 mb-6">Solve Model</h2>
 
-                    <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
-                        <div class="md:col-span-2">
-                            <div class="bg-gray-50 p-4 rounded-lg border border-gray-200">
-                                <h3 class="text-lg font-medium text-gray-800 mb-3">Model Summary</h3>
+                <div class="flex flex-wrap gap-3">
+                    <button id="downloadResultsBtn" class="bg-green-600 hover:bg-green-700 text-white font-medium py-2 px-4 rounded-md transition flex items-center disabled:opacity-50"
+                            @onclick="DownloadResults" disabled="@string.IsNullOrWhiteSpace(_output)">
+                        <i class="fas fa-file-download mr-2"></i> Download Results
+                    </button>
+                    <button id="resetSolverBtn" class="bg-gray-600 hover:bg-gray-700 text-white font-medium py-2 px-4 rounded-md transition flex items-center"
+                            @onclick="ResetSolver">
+                        <i class="fas fa-redo mr-2"></i> Reset
+                    </button>
+                </div>
+            </div>
 
-                                @if (parsedVarCount > 0)
+            <!-- Analysis Tab -->
+            <div id="analysis" class="tab-content">
+                <h2 class="text-2xl font-semibold text-gray-800 mb-6">Sensitivity Analysis</h2>
+
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
+                    <div>
+                        <div class="bg-gray-50 p-4 rounded-lg border border-gray-200 mb-6">
+                            <h3 class="text-lg font-medium text-gray-800 mb-3">Current Solution</h3>
+                            <div id="currentSolution" class="text-sm">
+                                @if (string.IsNullOrWhiteSpace(_solutionSummary))
                                 {
-                                    <!-- Parsed pre-solve summary -->
-                                    <div class="text-sm text-gray-700 mb-4">
-                                        <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
-                                            <div><span class="font-medium">Decision variables:</span> @parsedVarCount</div>
-                                            <div><span class="font-medium">Constraints:</span> @parsedConstrCount</div>
-                                            <div><span class="font-medium">Objective:</span> @((parsedIsMax ? "Maximize" : "Minimize"))</div>
-                                        </div>
-                                        @if (parsedRestrictions.Count > 0)
-                                        {
-                                            <div class="mt-2">
-                                                <div class="text-xs uppercase tracking-wide text-slate-500 mb-1">Sign & type restrictions</div>
-                                                <div class="flex flex-wrap gap-2">
-                                                    @for (int i = 0; i < parsedRestrictions.Count; i++)
-                                                    {
-                                                        <span class="@RestrictionPillClass(parsedRestrictions[i])">
-                                                            x@(i + 1): @HumanRestriction(parsedRestrictions[i])
-                                                        </span>
-                                                    }
-                                                </div>
-                                            </div>
-                                        }
-                                    </div>
+                                    <p class="text-gray-500 italic">No solution available yet. Please solve a model first.</p>
                                 }
-
-                                <div class="text-sm text-gray-700">
-                                    @if (string.IsNullOrWhiteSpace(_solutionSummary))
-                                    {
-                                        <p class="text-gray-500 italic">No solution yet. Click Run Solver.</p>
-                                    }
-                                    else
-                                    {
-                                        <p>@_solutionSummary</p>
-                                    }
-                                </div>
+                                else
+                                {
+                                    <p>@_solutionSummary</p>
+                                }
                             </div>
                         </div>
 
-                        <div>
-                            <div class="bg-gray-50 p-4 rounded-lg border border-gray-200">
-                                <h3 class="text-lg font-medium text-gray-800 mb-3">Algorithm Selection</h3>
-                                <div class="mb-4">
-                                    <label class="block text-sm font-medium text-gray-700 mb-1">Choose solving method:</label>
-                                    <InputSelect class="w-full border rounded px-2 py-1"
-                                                 @bind-Value="request.Algorithm"
-                                                 TValue="Algorithm">
-                                        <option value="@Algorithm.PrimalSimplex">Primal Simplex</option>
-                                        <option value="@Algorithm.RevisedSimplex">Revised Simplex</option>
-                                        <option value="@Algorithm.BranchAndBound">Branch &amp; Bound</option>
-                                        <option value="@Algorithm.Knapsack01">Knapsack</option>
-                                        <option value="@Algorithm.CuttingPlane">Cutting Plane</option>
-                                    </InputSelect>
-                                </div>
-                                <button class="w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-4 rounded-md transition flex items-center justify-center"
-                                        @onclick="RunSolver">
-                                    <i class="fas fa-play-circle mr-2"></i> Run Solver
+                        <div class="bg-gray-50 p-4 rounded-lg border border-gray-200">
+                            <h3 class="text-lg font-medium text-gray-800 mb-3">Sensitivity Tools</h3>
+                            <p class="text-sm text-gray-600 mb-4">Perform additional analysis on the solved model:</p>
+                            <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                                <!-- (buttons unchanged; JS handles clicks/alerts if you use it later) -->
+                                <button class="sensitivity-hardcoded bg-purple-100 hover:bg-purple-200 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center" data-analysis="range-nonbasic"
+                                        @onclick="ShowNonBasicCoeffRanges">
+                                    <i class="fas fa-ruler-horizontal mr-2"></i> Range of Non-Basic Var
+                                </button>
+                                <button class="sensitivity-btn bg-purple-100 hover:bg-purple-200 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center" data-analysis="change-nonbasic"
+                                        @onclick="ChangeNonBasicCoeffViaPrompt">
+                                    <i class="fas fa-exchange-alt mr-2"></i> Change Non-Basic Var
+                                </button>
+                                <button class="sensitivity-hardcoded bg-purple-100 hover:bg-purple-200 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center"
+                                        @onclick="ShowBasicCoeffRanges">
+                                    <i class="fas fa-sliders-h mr-2"></i> Basic Var Range
+                                </button>
+                                <button class="sensitivity-btn bg-purple-100 hover:bg-purple-200 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center" data-analysis="change-basic"
+                                        @onclick="ChangeBasicCoeffViaPrompt">
+                                    <i class="fas fa-random mr-2"></i> Change Basic Var
+                                </button>
+                                <button class="sensitivity-hardcoded bg-purple-100 hover:bg-purple-200 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center"
+                                        @onclick="ShowRhsRanges">
+                                    <i class="fas fa-ruler-vertical mr-2"></i> Range of RHS
+                                </button>
+                                <button class="sensitivity-btn bg-purple-100 hover:bg-purple-200 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center"
+                                        @onclick="ChangeRhsViaPrompt">
+                                    <i class="fas fa-retweet mr-2"></i> Change RHS Value
+                                </button>
+
+                                <button class="sensitivity-hardcoded bg-purple-100 hover:bg-purple-200 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center" data-analysis="range-nonbasic-col"
+                                        @onclick="ShowRangeNonBasicCol">
+                                    <i class="fas fa-columns mr-2"></i> Range in Non-Basic Col
+                                </button>
+                                <button class="sensitivity-hardcoded bg-purple-100 hover:bg-purple-200 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center" data-analysis="change-nonbasic-col"
+                                        @onclick="ShowChangeNonBasicCol">
+                                    <i class="fas fa-edit mr-2"></i> Change in Non-Basic Col
+                                </button>
+                                <button class="sensitivity-btn font-medium py-2 px-3 rounded-md text-sm flex items-center"
+                                        @onclick="AddActivityViaPrompt">
+                                    <i class="fas fa-plus-square mr-2"></i> Add New Activity
+                                </button>
+
+                                <button class="sensitivity-btn bg-purple-100 hover:bg-purple-200 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center"
+                                        @onclick="AddConstraintViaPrompt">
+                                    <i class="fas fa-plus-circle mr-2"></i> Add Constraint
+                                </button>
+                                <button class="sensitivity-hardcoded bg-purple-100 hover:bg-purple-200 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center"
+                                        @onclick="ShowShadowPrices">
+                                    <i class="fas fa-project-diagram mr-2"></i> Shadow Prices
+                                </button>
+                                <button class="sensitivity-btn bg-purple-100 hover:bg-purple-200 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center"
+                                        @onclick="ApplyDuality">
+                                    <i class="fas fa-code-branch mr-2"></i> Apply Duality
                                 </button>
                             </div>
                         </div>
                     </div>
-
-                    <div class="mb-8">
-                        <h3 class="text-xl font-semibold text-gray-800 mb-3">Solution Output</h3>
-                        <div class="bg-gray-50 border border-gray-200 rounded-lg p-4">
-                            <div class="text-sm font-mono">
-                                @if (string.IsNullOrWhiteSpace(_output))
+                    <div class="grid grid-cols-1 gap-6">
+                        <div class="bg-gray-50 p-4 rounded-lg border border-gray-200">
+                            <h3 class="text-lg font-medium text-gray-800 mb-3">Analysis Results</h3>
+                            <div id="sensitivityOutput" class="output-container text-sm font-mono">
+                                @if (string.IsNullOrWhiteSpace(_sensitivityHtml))
                                 {
-                                    <p class="text-gray-500 italic">Solution output will appear here after running the solver.</p>
+                                    <p class="text-gray-500 italic">Sensitivity analysis results will appear here.</p>
                                 }
                                 else
                                 {
-                                    <pre>@_output</pre>
+                                    @((MarkupString)_sensitivityHtml)
                                 }
                             </div>
                         </div>
                     </div>
-
-                    <div class="flex flex-wrap gap-3">
-                        <button class="bg-green-600 hover:bg-green-700 text-white font-medium py-2 px-4 rounded-md transition flex items-center disabled:opacity-50"
-                                @onclick="DownloadResults" disabled="@string.IsNullOrWhiteSpace(_output)">
-                            <i class="fas fa-file-download mr-2"></i> Download Results
-                        </button>
-                        <button class="bg-gray-600 hover:bg-gray-700 text-white font-medium py-2 px-4 rounded-md transition flex items-center"
-                                @onclick="ResetSolver">
-                            <i class="fas fa-redo mr-2"></i> Reset
-                        </button>
-                    </div>
                 </div>
-            }
-            else if (ActiveTab == Tab.Analysis)
-            {
-                <!-- Sensitivity Tab -->
-                <div>
-                    <h2 class="text-2xl font-semibold text-gray-800 mb-6">Sensitivity Analysis</h2>
-
-                    <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
-                        <div>
-                            <div class="bg-gray-50 p-4 rounded-lg border border-gray-200 mb-6">
-                                <h3 class="text-lg font-medium text-gray-800 mb-3">Current Solution</h3>
-                                <div class="text-sm">
-                                    @if (string.IsNullOrWhiteSpace(_solutionSummary))
-                                    {
-                                        <p class="text-gray-500 italic">No solution available yet. Please solve a model first.</p>
-                                    }
-                                    else
-                                    {
-                                        <p>@_solutionSummary</p>
-                                    }
-                                </div>
-                            </div>
-
-                            <div class="bg-gray-50 p-4 rounded-lg border border-gray-200">
-                                <h3 class="text-lg font-medium text-gray-800 mb-3">Sensitivity Tools</h3>
-                                <p class="text-sm text-gray-600 mb-4">Perform additional analysis on the solved model:</p>
-                                <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                                    <button class="bg-white hover:bg-slate-50 border border-slate-200 text-slate-800 font-medium py-2 px-3 rounded-md text-sm flex items-center"
-                                            @onclick="OpenRangeNonbasicDialog">
-                                        <i class="fas fa-ruler-horizontal mr-2"></i> Range of Non-Basic Var
-                                    </button>
-
-                                    <button class="bg-purple-100 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center" disabled>
-                                        <i class="fas fa-exchange-alt mr-2"></i> Change Non-Basic Var
-                                    </button>
-                                    <button class="bg-purple-100 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center" disabled>
-                                        <i class="fas fa-ruler-combined mr-2"></i> Range of Basic Var
-                                    </button>
-                                    <button class="bg-purple-100 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center" disabled>
-                                        <i class="fas fa-random mr-2"></i> Change Basic Var
-                                    </button>
-
-                                    <button class="bg-purple-100 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center"
-                                            @onclick='() => CallSensitivity("rhs-ranges")'>
-                                        <i class="fas fa-ruler-vertical mr-2"></i> Range of RHS
-                                    </button>
-                                    <button class="bg-purple-100 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center"
-                                            @onclick="ChangeRhsViaPrompt">
-                                        <i class="fas fa-retweet mr-2"></i> Change RHS Value
-                                    </button>
-
-                                    <button class="bg-purple-100 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center" disabled>
-                                        <i class="fas fa-columns mr-2"></i> Range in Non-Basic Col
-                                    </button>
-                                    <button class="bg-purple-100 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center" disabled>
-                                        <i class="fas fa-edit mr-2"></i> Change in Non-Basic Col
-                                    </button>
-                                    <button class="bg-purple-100 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center" disabled>
-                                        <i class="fas fa-plus-square mr-2"></i> Add New Activity
-                                    </button>
-                                    <button class="bg-purple-100 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center"
-                                            @onclick="AddConstraintViaPrompt">
-                                        <i class="fas fa-plus-circle mr-2"></i> Add Constraint
-                                    </button>
-
-                                    <button class="bg-purple-100 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center"
-                                            @onclick='() => CallSensitivity("shadow-prices")'>
-                                        <i class="fas fa-project-diagram mr-2"></i> Shadow Prices
-                                    </button>
-                                    <button class="bg-purple-100 text-purple-800 font-medium py-2 px-3 rounded-md text-sm flex items-center"
-                                            @onclick="ApplyDuality">
-                                        <i class="fas fa-code-branch mr-2"></i> Apply Duality
-                                    </button>
-                                </div>
-                            </div>
-                        </div>
-
-                        <div class="grid grid-cols-1 gap-6">
-                            <div class="bg-gray-50 p-4 rounded-lg border border-gray-200">
-                                <h3 class="text-lg font-medium text-gray-800 mb-3">Analysis Results</h3>
-                                <div class="text-sm font-mono">
-                                    @if (nonbasicResult is not null)
-                                    {
-                                        <div class="font-sans">
-                                            <div class="mt-0 bg-white rounded-xl shadow-sm border border-slate-200 p-5">
-                                                <div class="flex items-center gap-3 mb-3">
-                                                    <div class="h-10 w-10 rounded-full bg-indigo-100 flex items-center justify-center">
-                                                        <i class="fas fa-ruler-horizontal text-indigo-600"></i>
-                                                    </div>
-                                                    <div>
-                                                        <div class="text-sm text-slate-500">Range for Non-Basic Variable</div>
-                                                        <div class="text-xl font-semibold text-slate-800">@nonbasicResult!.label</div>
-                                                    </div>
-                                                </div>
-
-                                                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                                                    <div class="p-3 rounded-lg bg-slate-50 border">
-                                                        <div class="text-xs uppercase tracking-wide text-slate-500">Current c<sub>j</sub></div>
-                                                        <div class="text-lg font-medium">@nonbasicResult.currentCoefficient.ToString("0.######")</div>
-                                                    </div>
-                                                    <div class="p-3 rounded-lg bg-slate-50 border">
-                                                        <div class="text-xs uppercase tracking-wide text-slate-500">Reduced Cost r<sub>j</sub></div>
-                                                        <div class="text-lg font-medium">@nonbasicResult.reducedCost.ToString("0.######")</div>
-                                                    </div>
-                                                    <div class="p-3 rounded-lg bg-slate-50 border">
-                                                        <div class="text-xs uppercase tracking-wide text-slate-500">Allowed Increase Δ (keep basis optimal)</div>
-                                                        <div class="text-lg font-medium">
-                                                            @if (nonbasicResult.increaseUnbounded)
-                                                            {
-                                                                <span>unbounded</span>
-                                                            }
-                                                            else
-                                                            {
-                                                                <span>≤ @nonbasicResult.allowableIncrease.ToString("0.######")</span>
-                                                            }
-                                                        </div>
-                                                    </div>
-                                                    <div class="p-3 rounded-lg bg-slate-50 border">
-                                                        <div class="text-xs uppercase tracking-wide text-slate-500">New Upper Bound on c<sub>j</sub></div>
-                                                        <div class="text-lg font-medium">
-                                                            ≤ @FormatBound(nonbasicResult.coefficientUpperBound, false, nonbasicResult.upperIsPosInf)
-                                                        </div>
-                                                    </div>
-                                                </div>
-
-                                                <div class="mt-3 text-sm text-slate-600">
-                                                    <p>@nonbasicResult.explanation</p>
-                                                    <p class="mt-1 text-slate-500"><em>Note:</em> For maximization in canonical form, keeping all reduced costs ≤ 0 preserves optimality and the current basis.</p>
-                                                </div>
-                                            </div>
-                                        </div>
-                                    }
-                                    @if (!string.IsNullOrWhiteSpace(_sensitivityRaw))
-                                    {
-                                        <pre>@_sensitivityRaw</pre>
-                                    }
-                                    else if (nonbasicResult is null)
-                                    {
-                                        <p class="text-gray-500 italic">Sensitivity analysis results will appear here.</p>
-                                    }
-                                </div>
-                            </div>
-
-                            <div class="bg-gray-50 p-4 rounded-lg border border-gray-200">
-                                <h3 class="text-lg font-medium text-gray-800 mb-3">Graphical Analysis</h3>
-                                <canvas id="sensitivityChart" height="300"></canvas>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            }
+            </div>
         </div>
     </div>
 
@@ -388,141 +266,11 @@
     </footer>
 </div>
 
-@* Modal: Range for Non-Basic Variable *@
-@if (showRangeNonbasic)
-{
-    <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm">
-        <div class="bg-white rounded-2xl shadow-xl w-full max-w-lg">
-            <div class="px-5 py-4 border-b flex items-center justify-between">
-                <h3 class="text-lg font-semibold text-slate-800">Range of Non-Basic Variable</h3>
-                <button class="text-slate-400 hover:text-slate-600" @onclick="() => showRangeNonbasic = false">
-                    <span class="text-2xl leading-none">&times;</span>
-                </button>
-            </div>
-
-            <div class="p-5 space-y-4">
-                @if (nonbasicOptions?.Count > 0)
-                {
-                    <div>
-                        <label class="block text-sm font-medium text-slate-700 mb-1">Choose a non-basic variable</label>
-                        <select class="w-full border border-slate-300 rounded-md p-2 focus:outline-none focus:ring"
-                                @bind="selectedNonbasicIndex">
-                            @foreach (var opt in nonbasicOptions)
-                            {
-                                <option value="@opt.index">@opt.label (@opt.reducedCost.ToString("0.###"))</option>
-                            }
-                        </select>
-                        <p class="text-xs text-slate-500 mt-1">Value in parentheses is the current reduced cost.</p>
-                    </div>
-                }
-                else
-                {
-                    <div class="text-red-600">No non-basic variables found. Solve a model first.</div>
-                }
-            </div>
-
-            <div class="px-5 py-4 border-t flex justify-end gap-2">
-                <button class="px-4 py-2 rounded-lg border border-slate-300 text-slate-700 hover:bg-slate-50"
-                        @onclick="() => showRangeNonbasic = false">
-                    Cancel
-                </button>
-                <button class="px-4 py-2 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
-                        disabled="@(nonbasicOptions == null || nonbasicOptions.Count == 0)"
-                        @onclick="ConfirmRangeNonbasicAsync">
-                    Show Range
-                </button>
-            </div>
-        </div>
-    </div>
-}
-
 @code {
-    // ----- Tabs -----
-    enum Tab { Upload, Solve, Analysis }
-    Tab ActiveTab = Tab.Upload;
-
-    string TabBtnClass(Tab t) =>
-        $"py-4 px-6 font-medium focus:outline-none border-b-2 transition " +
-        (ActiveTab == t
-            ? "text-blue-700 border-blue-600"
-            : "text-gray-500 hover:text-blue-600 border-transparent hover:border-blue-300");
-
-    void SetTab(Tab t)
-    {
-        ActiveTab = t;
-        StateHasChanged();
-    }
-
-    // ----- Types for deserialization -----
-    public sealed class NonbasicOption
-    {
-        public int index { get; set; }
-        public string? label { get; set; }
-        public double reducedCost { get; set; }
-    }
-
-    public sealed class RangeNonbasicResponse
-    {
-        public int index { get; set; }
-        public string? label { get; set; }
-        public int k { get; set; }
-        public double currentCoefficient { get; set; }  // c_j
-        public double reducedCost { get; set; }         // r_j
-        public double yDotNcol { get; set; }            // y^T a_j
-
-        public double allowableIncrease { get; set; }
-        public double allowableDecrease { get; set; }
-
-        public double coefficientLowerBound { get; set; }
-        public double coefficientUpperBound { get; set; }
-
-        public bool increaseUnbounded { get; set; }
-        public bool decreaseUnbounded { get; set; }
-        public bool lowerIsNegInf { get; set; }
-        public bool upperIsPosInf { get; set; }
-
-        public string? explanation { get; set; }
-    }
-
-    private sealed class RangeWrap
-    {
-        public bool success { get; set; }
-        public RangeNonbasicResponse? data { get; set; }
-        // some servers also flatten fields; we accept both shapes
-        public int index { get; set; }
-        public string? label { get; set; }
-        public int k { get; set; }
-        public int k1 { get; set; }
-        public double cj { get; set; }
-        public double rj { get; set; }
-        public double yTa { get; set; }
-        public double allowedIncrease { get; set; }
-        public double allowedDecrease { get; set; }
-        public double lowerBound { get; set; }
-        public double upperBound { get; set; }
-        public bool increaseUnbounded { get; set; }
-        public bool decreaseUnbounded { get; set; }
-        public bool lowerIsNegInf { get; set; }
-        public bool upperIsPosInf { get; set; }
-        public string? explanation { get; set; }
-    }
-
-    // ----- UI state -----
+    // model text populated by either the Blazor file read OR your existing JS preview
     private string _modelText = "";
     private string _output = "";
     private string _solutionSummary = "";
-    private string _sensitivityRaw = "";
-
-    // parsed structure
-    private int parsedVarCount = 0;
-    private int parsedConstrCount = 0;
-    private bool parsedIsMax = true;
-    private List<string> parsedRestrictions = new();
-
-    private bool showRangeNonbasic = false;
-    private List<NonbasicOption> nonbasicOptions = new();
-    private int? selectedNonbasicIndex = null;
-    private RangeNonbasicResponse? nonbasicResult = null;
 
     private SolveRequest request = new()
         {
@@ -535,7 +283,413 @@
             }
         };
 
-    // ----- Upload -----
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            await JS.InvokeVoidAsync("initializeApp");
+        }
+    }
+
+    //Tom add
+
+    private async Task ClearUiOutputsAsync()
+    {
+        // clear Blazor state
+        _output = "";
+        _sensitivityHtml = "";
+
+        // also clear any HTML previously injected by JS into those containers
+        await JS.InvokeVoidAsync("eval",
+            "const a=document.getElementById('solverOutput'); if(a) a.innerHTML='';" +
+            "const b=document.getElementById('sensitivityOutput'); if(b) b.innerHTML='';");
+    }
+
+
+
+    /* Route fixer: send RHS ranges to /api/solve/rhs-ranges
+    private async Task CallSensitivity(string endpoint)
+    {
+        try
+        {
+            string url = endpoint switch
+            {
+                "rhs-ranges" => "api/solve/rhs-ranges",
+                _ => $"api/sensitivity/{endpoint}" // keep others as-is (if you add a SensitivityController)
+            };
+
+            var resp = await Http.GetAsync($"api/solve/{endpoint}");
+            var raw = await resp.Content.ReadAsStringAsync();
+
+            string display;
+            if (resp.IsSuccessStatusCode &&
+                !string.IsNullOrWhiteSpace(raw) &&
+                (raw.TrimStart().StartsWith("{") || raw.TrimStart().StartsWith("[")))
+            {
+                using var doc = System.Text.Json.JsonDocument.Parse(raw);
+                display = System.Text.Json.JsonSerializer.Serialize(
+                    doc,
+                    new System.Text.Json.JsonSerializerOptions { WriteIndented = true }
+                );
+            }
+            else
+            {
+                display = string.IsNullOrWhiteSpace(raw)
+                    ? $"{(int)resp.StatusCode} {resp.ReasonPhrase}"
+                    : raw;
+            }
+
+            await JS.InvokeVoidAsync("renderSensitivity", display);
+        }
+        catch (Exception ex)
+        {
+            await JS.InvokeVoidAsync("renderSensitivity", $"Error calling API: {ex.Message}");
+        }
+    }*/
+
+    // --------- LOCAL, NO-API: show hard-coded RHS range ----------
+
+
+    private string _sensitivityHtml = "";
+    private string _empty = "";
+
+
+    private async Task ShowRhsRanges()
+    {
+        await ClearUiOutputsAsync();
+
+
+        // Replace with whatever numbers you want to display;
+        // using your Excel sensitivity example:
+        _sensitivityHtml = @"
+<h4 class='font-semibold text-gray-800 mb-2'>Range of RHS</h4>
+<table class='min-w-full text-xs border border-gray-200'>
+  <thead class='bg-gray-100'>
+    <tr>
+      <th class='p-2 text-left'>Constraint</th>
+      <th class='p-2 text-right'>RHS</th>
+      <th class='p-2 text-right'>Allowable Increase</th>
+      <th class='p-2 text-right'>Allowable Decrease</th>
+      <th class='p-2 text-right'>Valid Range</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr class='border-t'>
+      <td class='p-2'>c1</td>
+      <td class='p-2 text-right'>40</td>
+      <td class='p-2 text-right'>40</td>
+      <td class='p-2 text-right'>40</td>
+      <td class='p-2 text-right'>[0, 80]</td>
+    </tr>
+  </tbody>
+</table>
+<p class='text-gray-600 mt-2'>Within this range, the current basis remains optimal.</p>";
+
+        StateHasChanged();
+    }
+
+    private async Task ShowShadowPrices()
+    {
+        await ClearUiOutputsAsync();
+
+        _sensitivityHtml = @"
+<h4 class='font-semibold text-gray-800 mb-2'>Shadow Prices</h4>
+<table class='min-w-full text-xs border border-gray-200'>
+  <thead class='bg-gray-100'>
+    <tr>
+      <th class='p-2 text-left'>Constraint</th>
+      <th class='p-2 text-right'>Shadow Price</th>
+      <th class='p-2 text-left'>Interpretation</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr class='border-t'>
+      <td class='p-2'>c1</td>
+      <td class='p-2 text-right'>0.5</td>
+      <td class='p-2'>For small Δ in RHS (within [0, 80]), objective changes by 0.5 × Δ.</td>
+    </tr>
+  </tbody>
+</table>";
+
+        StateHasChanged();
+    }
+
+    private async Task ShowBasicCoeffRanges()
+    {
+        await ClearUiOutputsAsync();
+
+        // Hard-coded from your screenshot:
+        // x3 is basic with Obj. Coeff = 3, Allowable Decrease = 0.6, Allowable Increase = unbounded
+        // => coefficient range = [3 - 0.6, ∞) = [2.4, ∞)
+        _sensitivityHtml = @"
+<h4 class='font-semibold text-gray-800 mb-2'>Basic Variables — Objective Coefficient Ranges</h4>
+<p class='text-gray-600 mb-2'>Range on the <em>objective coefficients</em> that keeps the current basis optimal.</p>
+<table class='min-w-full text-xs border border-gray-200'>
+  <thead class='bg-gray-100'>
+    <tr>
+      <th class='p-2 text-left'>Variable</th>
+      <th class='p-2 text-right'>Final Value</th>
+      <th class='p-2 text-right'>Current Coeff</th>
+      <th class='p-2 text-right'>Allowable ↓</th>
+      <th class='p-2 text-right'>Allowable ↑</th>
+      <th class='p-2 text-right'>Coeff Range</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr class='border-t'>
+      <td class='p-2'>x3</td>
+      <td class='p-2 text-right'>6.667</td>
+      <td class='p-2 text-right'>3</td>
+      <td class='p-2 text-right'>0.6</td>
+      <td class='p-2 text-right'>&infin;</td>
+      <td class='p-2 text-right'>[2.4, &infin;)</td>
+    </tr>
+  </tbody>
+</table>";
+
+        StateHasChanged();
+    }
+
+    private async Task ShowNonBasicCoeffRanges()
+    {
+        await ClearUiOutputsAsync();
+
+        // Hard-coded using your screenshot values
+        _sensitivityHtml = @"
+<h4 class='font-semibold text-gray-800 mb-2'>Non-Basic Variables — Objective Coefficient Ranges</h4>
+<p class='text-gray-600 mb-2'>Since these are non-basic (value = 0), their coefficient can vary within the ranges below without entering the basis.</p>
+<table class='min-w-full text-xs border border-gray-200'>
+  <thead class='bg-gray-100'>
+    <tr>
+      <th class='p-2 text-left'>Variable</th>
+      <th class='p-2 text-right'>Final Value</th>
+      <th class='p-2 text-right'>Current Coeff</th>
+      <th class='p-2 text-right'>Allowable ↓</th>
+      <th class='p-2 text-right'>Allowable ↑</th>
+      <th class='p-2 text-right'>Coeff Range</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr class='border-t'>
+      <td class='p-2'>x1</td>
+      <td class='p-2 text-right'>0</td>
+      <td class='p-2 text-right'>2</td>
+      <td class='p-2 text-right'>3.5</td>
+      <td class='p-2 text-right'>2</td>
+      <td class='p-2 text-right'>[-1.5, 4]</td>
+    </tr>
+    <tr class='border-t'>
+      <td class='p-2'>x2</td>
+      <td class='p-2 text-right'>0</td>
+      <td class='p-2 text-right'>3</td>
+      <td class='p-2 text-right'>1</td>
+      <td class='p-2 text-right'>3</td>
+      <td class='p-2 text-right'>[2, 6]</td>
+    </tr>
+    <tr class='border-t'>
+      <td class='p-2'>x4</td>
+      <td class='p-2 text-right'>0</td>
+      <td class='p-2 text-right'>5</td>
+      <td class='p-2 text-right'>2</td>
+      <td class='p-2 text-right'>5</td>
+      <td class='p-2 text-right'>[3, 10]</td>
+    </tr>
+    <tr class='border-t'>
+      <td class='p-2'>x5</td>
+      <td class='p-2 text-right'>0</td>
+      <td class='p-2 text-right'>2</td>
+      <td class='p-2 text-right'>2</td>
+      <td class='p-2 text-right'>1</td>
+      <td class='p-2 text-right'>[0, 3]</td>
+    </tr>
+    <tr class='border-t'>
+      <td class='p-2'>x6</td>
+      <td class='p-2 text-right'>0</td>
+      <td class='p-2 text-right'>4</td>
+      <td class='p-2 text-right'>1</td>
+      <td class='p-2 text-right'>4</td>
+      <td class='p-2 text-right'>[3, 8]</td>
+    </tr>
+  </tbody>
+</table>";
+
+        StateHasChanged();
+    }
+
+    private async Task ChangeNonBasicCoeffViaPrompt()
+    {
+        try
+        {
+            // Tell user which non-basics are allowed
+            var which = await JS.InvokeAsync<string>(
+                "prompt",
+                "Which NON-BASIC variable to change? Options: x1, x2, x4, x5, x6",
+                "x1"
+            );
+            if (string.IsNullOrWhiteSpace(which)) return;
+
+            // Accept forms like "x1" or "1"
+            which = which.Trim().ToLowerInvariant();
+            if (which.StartsWith("x")) which = which.Substring(1);
+
+            if (!int.TryParse(which, out var oneBased) || oneBased <= 0)
+            {
+                await JS.InvokeVoidAsync("renderSensitivity", "Invalid variable choice.");
+                return;
+            }
+
+            var coeffStr = await JS.InvokeAsync<string>(
+                "prompt",
+                $"New objective coefficient for x{oneBased}?",
+                "1"
+            );
+            if (string.IsNullOrWhiteSpace(coeffStr)) return;
+
+            if (!double.TryParse(coeffStr,
+                                 System.Globalization.NumberStyles.Any,
+                                 System.Globalization.CultureInfo.InvariantCulture,
+                                 out var newCoeff))
+            {
+                await JS.InvokeVoidAsync("renderSensitivity", "Invalid coefficient.");
+                return;
+            }
+
+            var resp = await Http.PostAsJsonAsync("api/solve/change-nonbasic-coeff",
+                new { VarIndex = oneBased, NewCoeff = newCoeff });
+
+            var text = await resp.Content.ReadAsStringAsync();
+            await JS.InvokeVoidAsync("renderSensitivity",
+                string.IsNullOrWhiteSpace(text) ? $"{(int)resp.StatusCode} {resp.ReasonPhrase}" : text);
+        }
+        catch (Exception ex)
+        {
+            await JS.InvokeVoidAsync("renderSensitivity", $"Error: {ex.Message}");
+        }
+    }
+
+    // ... other handlers ...
+
+    private async Task ChangeBasicCoeffViaPrompt()
+    {
+        try
+        {
+            await ClearUiOutputsAsync();
+
+            // Only x3 is basic in your current setup
+            var which = await JS.InvokeAsync<string>(
+                "prompt",
+                "Which BASIC variable to change? (Only x3 is allowed)",
+                "x3"
+            );
+            if (string.IsNullOrWhiteSpace(which)) return;
+
+            which = which.Trim().ToLowerInvariant();
+            if (which.StartsWith("x")) which = which.Substring(1);
+            if (!int.TryParse(which, out var oneBased) || oneBased != 3)
+            {
+                await JS.InvokeVoidAsync("renderSensitivity", "Only variable x3 is allowed here.");
+                return;
+            }
+
+            var coeffStr = await JS.InvokeAsync<string>(
+                "prompt",
+                "New objective coefficient for x3?",
+                "1"
+            );
+            if (string.IsNullOrWhiteSpace(coeffStr)) return;
+
+            if (!double.TryParse(coeffStr,
+                                 System.Globalization.NumberStyles.Any,
+                                 System.Globalization.CultureInfo.InvariantCulture,
+                                 out var newCoeff))
+            {
+                await JS.InvokeVoidAsync("renderSensitivity", "Invalid coefficient.");
+                return;
+            }
+
+            var resp = await Http.PostAsJsonAsync("api/solve/change-basic-coeff",
+                new { VarIndex = oneBased, NewCoeff = newCoeff });
+
+            var text = await resp.Content.ReadAsStringAsync();
+            await JS.InvokeVoidAsync("renderSensitivity",
+                string.IsNullOrWhiteSpace(text) ? $"{(int)resp.StatusCode} {resp.ReasonPhrase}" : text);
+        }
+        catch (Exception ex)
+        {
+            await JS.InvokeVoidAsync("renderSensitivity", $"Error: {ex.Message}");
+        }
+    }
+
+    private async Task ShowRangeNonBasicCol()
+    {
+        await ClearUiOutputsAsync();
+
+        // Hard-coded example ranges for columns of non-basic vars (x1, x2, x4, x5, x6)
+        _sensitivityHtml = @"
+<h4 class='font-semibold text-gray-800 mb-2'>Range in Non-Basic Column</h4>
+<p class='text-gray-600 mb-2'>
+For each non-basic variable, these are allowable changes to its constraint <em>column</em> that keep the current basis optimal.
+</p>
+<table class='min-w-full text-xs border border-gray-200'>
+  <thead class='bg-gray-100'>
+    <tr>
+      <th class='p-2 text-left'>Variable</th>
+      <th class='p-2 text-left'>Constraint</th>
+      <th class='p-2 text-right'>Current Coeff</th>
+      <th class='p-2 text-right'>Allowable ↓</th>
+      <th class='p-2 text-right'>Allowable ↑</th>
+      <th class='p-2 text-left'>Valid Interval</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr class='border-t'><td class='p-2'>x1</td><td class='p-2'>c1</td><td class='p-2 text-right'>11</td><td class='p-2 text-right'>2</td><td class='p-2 text-right'>5</td><td class='p-2'>[9, 16]</td></tr>
+    <tr class='border-t'><td class='p-2'>x2</td><td class='p-2'>c1</td><td class='p-2 text-right'>8</td><td class='p-2 text-right'>unbounded</td><td class='p-2 text-right'>3</td><td class='p-2'>(-∞, 11]</td></tr>
+    <tr class='border-t'><td class='p-2'>x4</td><td class='p-2'>c1</td><td class='p-2 text-right'>14</td><td class='p-2 text-right'>4</td><td class='p-2 text-right'>unbounded</td><td class='p-2'>[10, +∞)</td></tr>
+    <tr class='border-t'><td class='p-2'>x5</td><td class='p-2'>c1</td><td class='p-2 text-right'>10</td><td class='p-2 text-right'>1</td><td class='p-2 text-right'>2</td><td class='p-2'>[9, 12]</td></tr>
+    <tr class='border-t'><td class='p-2'>x6</td><td class='p-2'>c1</td><td class='p-2 text-right'>10</td><td class='p-2 text-right'>unbounded</td><td class='p-2 text-right'>1</td><td class='p-2'>(-∞, 11]</td></tr>
+  </tbody>
+</table>
+<p class='text-gray-600 mt-2'></p>";
+        StateHasChanged();
+    }
+
+    private async Task ShowChangeNonBasicCol()
+    {
+        await ClearUiOutputsAsync();
+
+        // Hard-coded example “applied change” summary for a non-basic column tweak
+        _sensitivityHtml = @"
+<h4 class='font-semibold text-gray-800 mb-2'>Change in Non-Basic Column</h4>
+<p class='text-gray-600 mb-2'>
+Example: set the c1-coefficient of <strong>x1</strong> from 11 to <strong>15</strong>. The current basis remains optimal; reduced cost sign is preserved.
+</p>
+<ul class='list-disc pl-5 text-sm'>
+  <li>Changed a<sub>c1,x1</sub>: 11 → 15 (within [9, 16])</li>
+  <li>Basis: unchanged</li>
+  <li>Objective (no re-solve shown here): hard-coded preview</li>
+</ul>
+<p class='text-gray-600 mt-2'></p>";
+        StateHasChanged();
+    }
+
+
+
+
+
+
+
+
+
+
+
+    // ... end handlers ...
+
+
+
+
+
+
+    // Capture uploaded file content (no visual change; input stays hidden)
     private async Task HandleFile(InputFileChangeEventArgs e)
     {
         var file = e.File;
@@ -544,103 +698,29 @@
         using var stream = file.OpenReadStream(2 * 1024 * 1024);
         using var reader = new StreamReader(stream);
         _modelText = await reader.ReadToEndAsync();
+
+        // Keep SolveRequest in sync for the API
         request.ModelText = _modelText;
 
-        ParseModelStructure(_modelText);
-
-        try
-        {
-            await JS.InvokeVoidAsync("modelUI.modelLoadedToast",
-                $"Model loaded: {parsedVarCount} vars, {parsedConstrCount} constraints");
-        }
-        catch { }
-
-        ActiveTab = Tab.Solve;
         StateHasChanged();
     }
 
-    // Robust but compact parser for the simple text format
-    private void ParseModelStructure(string text)
-    {
-        parsedVarCount = 0;
-        parsedConstrCount = 0;
-        parsedIsMax = true;
-        parsedRestrictions.Clear();
-
-        if (string.IsNullOrWhiteSpace(text)) return;
-
-        var lines = text
-            .Split(new[] { "\r\n", "\n" }, StringSplitOptions.None)
-            .Select(l => l.Trim())
-            .Where(l => !string.IsNullOrWhiteSpace(l) && !l.StartsWith("#"))
-            .ToList();
-
-        if (lines.Count < 2) return;
-
-        var obj = lines[0];
-        var toks = obj.Split(' ', StringSplitOptions.RemoveEmptyEntries).ToList();
-        if (toks.Count > 0)
-        {
-            var sense = toks[0].ToLowerInvariant();
-            parsedIsMax = sense.StartsWith("max");
-            var coeffs = toks.Skip(1).Where(IsNumberish).ToList();
-            parsedVarCount = coeffs.Count;
-        }
-
-        var last = lines[^1];
-        var rToks = last.Split(' ', StringSplitOptions.RemoveEmptyEntries).ToList();
-        parsedRestrictions = rToks.Where(t => IsRestrictionToken(t)).ToList();
-
-        parsedConstrCount = lines
-            .Skip(1).Take(Math.Max(0, lines.Count - 2))
-            .Count(l => l.Contains("<=") || l.Contains(">=") || l.Contains("="));
-    }
-
-    private static bool IsNumberish(string s)
-        => double.TryParse(s.Replace("+", ""), System.Globalization.NumberStyles.Any,
-                           System.Globalization.CultureInfo.InvariantCulture, out _);
-
-    private static bool IsRestrictionToken(string s)
-    {
-        s = s.ToLowerInvariant();
-        return s is "+" or "-" or "urs" or "int" or "bin";
-    }
-
-    private string HumanRestriction(string s)
-    {
-        s = s.ToLowerInvariant();
-        return s switch
-        {
-            "+" => "x ≥ 0",
-            "-" => "x ≤ 0",
-            "urs" => "unrestricted",
-            "int" => "integer",
-            "bin" => "binary",
-            _ => s
-        };
-    }
-
-    private string RestrictionPillClass(string s)
-    {
-        s = s.ToLowerInvariant();
-        var baseCls = "inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium border";
-        return s switch
-        {
-            "+" => $"{baseCls} bg-green-50 text-green-800 border-green-200",
-            "-" => $"{baseCls} bg-rose-50 text-rose-800 border-rose-200",
-            "urs" => $"{baseCls} bg-slate-50 text-slate-700 border-slate-200",
-            "int" => $"{baseCls} bg-amber-50 text-amber-800 border-amber-200",
-            "bin" => $"{baseCls} bg-violet-50 text-violet-800 border-violet-200",
-            _ => $"{baseCls} bg-gray-50 text-gray-700 border-gray-200"
-        };
-    }
-
-    // ----- Solve -----
     private async Task RunSolver()
     {
+        // Fallback: if Blazor didn't read, try to grab JS preview text
         if (string.IsNullOrWhiteSpace(request.ModelText))
         {
-            await JS.InvokeVoidAsync("alert", "Please upload a model first.");
+            try
+            {
+                var txt = await JS.InvokeAsync<string>("eval", "document.getElementById('filePreview')?.textContent || ''");
+                request.ModelText = txt ?? "";
+            }
+            catch { /* ignore */ }
+        }
+
+        if (string.IsNullOrWhiteSpace(request.ModelText))
+        {
+            await JS.InvokeVoidAsync("showAlert", "Please upload a model first.", "warning");
             return;
         }
 
@@ -662,14 +742,14 @@
             var body = await resp.Content.ReadFromJsonAsync<SolveResponse>();
             _output = body?.OutputText ?? "(no output)";
             _solutionSummary = body?.SolutionSummary ?? "";
+            StateHasChanged();
         }
         catch (Exception ex)
         {
             _output = $"Error calling solver: {ex.Message}";
             _solutionSummary = "";
+            StateHasChanged();
         }
-
-        StateHasChanged();
     }
 
     private void ResetSolver()
@@ -678,159 +758,32 @@
         request.ModelText = "";
         _output = "";
         _solutionSummary = "";
-        _sensitivityRaw = "";
-        nonbasicResult = null;
-
-        parsedVarCount = 0;
-        parsedConstrCount = 0;
-        parsedRestrictions.Clear();
-        parsedIsMax = true;
-
-        ActiveTab = Tab.Upload;
     }
 
     private async Task DownloadResults()
     {
         if (string.IsNullOrWhiteSpace(_output))
         {
-            await JS.InvokeVoidAsync("alert", "No results to download.");
+            await JS.InvokeVoidAsync("showAlert", "No results to download.", "warning");
             return;
         }
 
+        // Use a small JS helper (you already have download.js)
         var bytes = System.Text.Encoding.UTF8.GetBytes(_output);
         var b64 = Convert.ToBase64String(bytes);
         await JS.InvokeVoidAsync("downloadFile", "lp_solution.txt", "text/plain", b64);
     }
 
-    // ----- Sensitivity (generic -> text box) -----
-    private async Task CallSensitivity(string endpoint)
-    {
-        nonbasicResult = null;
-        try
-        {
-            var resp = await Http.GetAsync($"api/sensitivity/{endpoint}");
-            var raw = await resp.Content.ReadAsStringAsync();
-
-            _sensitivityRaw = (resp.IsSuccessStatusCode && LooksLikeJson(raw))
-                ? PrettyJson(raw)
-                : string.IsNullOrWhiteSpace(raw) ? $"{(int)resp.StatusCode} {resp.ReasonPhrase}" : raw;
-        }
-        catch (Exception ex)
-        {
-            _sensitivityRaw = $"Error calling API: {ex.Message}";
-        }
-        StateHasChanged();
-    }
-
-    private static bool LooksLikeJson(string s)
-        => !string.IsNullOrWhiteSpace(s) && (s.TrimStart().StartsWith("{") || s.TrimStart().StartsWith("["));
-
-    private static string PrettyJson(string raw)
-    {
-        try
-        {
-            using var doc = System.Text.Json.JsonDocument.Parse(raw);
-            return System.Text.Json.JsonSerializer.Serialize(doc, new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
-        }
-        catch { return raw; }
-    }
-
-    // ----- Range of Non-Basic (modal) -----
-    private async Task OpenRangeNonbasicDialog()
-    {
-        _sensitivityRaw = "";
-        nonbasicResult = null;
-
-        try
-        {
-            var resp = await Http.GetFromJsonAsync<List<NonbasicOption>>("api/sensitivity/nonbasic-list");
-            nonbasicOptions = resp ?? new();
-            selectedNonbasicIndex = nonbasicOptions.FirstOrDefault()?.index;
-            showRangeNonbasic = true;
-        }
-        catch (Exception ex)
-        {
-            await JS.InvokeVoidAsync("alert", $"Failed to load non-basic variables: {ex.Message}");
-        }
-        StateHasChanged();
-    }
-
-    private async Task ConfirmRangeNonbasicAsync()
-    {
-        if (selectedNonbasicIndex is null) return;
-
-        try
-        {
-            var url = $"api/sensitivity/range-nonbasic/{selectedNonbasicIndex}";
-            // try direct first
-            var direct = await Http.GetFromJsonAsync<RangeNonbasicResponse>(url);
-            if (direct != null && (direct.label != null || !string.IsNullOrWhiteSpace(direct.explanation)))
-            {
-                nonbasicResult = direct;
-            }
-            else
-            {
-                // fallback: wrapper shape
-                var wrap = await Http.GetFromJsonAsync<RangeWrap>(url);
-                if (wrap?.data != null) nonbasicResult = wrap.data;
-                else if (wrap != null)
-                {
-                    nonbasicResult = new RangeNonbasicResponse
-                        {
-                            index = wrap.index,
-                            k = wrap.k,
-                            label = wrap.label ?? $"x{(wrap.k1 > 0 ? wrap.k1 : wrap.k + 1)}",
-                            currentCoefficient = wrap.cj,
-                            reducedCost = wrap.rj,
-                            yDotNcol = wrap.yTa,
-                            allowableIncrease = wrap.allowedIncrease,
-                            allowableDecrease = wrap.allowedDecrease,
-                            coefficientLowerBound = wrap.lowerBound,
-                            coefficientUpperBound = wrap.upperBound,
-                            increaseUnbounded = wrap.increaseUnbounded,
-                            decreaseUnbounded = wrap.decreaseUnbounded,
-                            lowerIsNegInf = wrap.lowerIsNegInf,
-                            upperIsPosInf = wrap.upperIsPosInf,
-                            explanation = wrap.explanation
-                        };
-                }
-            }
-
-            if (nonbasicResult == null)
-                await JS.InvokeVoidAsync("alert", "No data returned for the selected variable.");
-            else
-                ActiveTab = Tab.Analysis;
-        }
-        catch (Exception ex)
-        {
-            await JS.InvokeVoidAsync("alert", $"Failed to compute range: {ex.Message}");
-        }
-        finally
-        {
-            showRangeNonbasic = false;
-            StateHasChanged();
-        }
-    }
-
-    // pretty-print bounds (handles flags or sentinel Min/MaxValue)
-    private static string FormatBound(double v, bool isNegInf = false, bool isPosInf = false)
-    {
-        if (isNegInf || v <= double.MinValue / 2) return "−∞";
-        if (isPosInf || v >= double.MaxValue / 2) return "∞";
-        return v.ToString("0.######", System.Globalization.CultureInfo.InvariantCulture);
-    }
-
-    // ----- Quick actions (prompt-based) -----
     private async Task ChangeRhsViaPrompt()
     {
         try
         {
+            // 0-based constraint index
             var idxStr = await JS.InvokeAsync<string>("prompt", "Which constraint index? (0-based)", "0");
             if (string.IsNullOrWhiteSpace(idxStr)) return;
             if (!int.TryParse(idxStr, out var idx))
             {
-                _sensitivityRaw = "Invalid index.";
-                StateHasChanged();
+                await JS.InvokeVoidAsync("renderSensitivity", "Invalid index.");
                 return;
             }
 
@@ -839,21 +792,20 @@
             if (!double.TryParse(rhsStr, System.Globalization.NumberStyles.Any,
                                  System.Globalization.CultureInfo.InvariantCulture, out var rhs))
             {
-                _sensitivityRaw = "Invalid RHS.";
-                StateHasChanged();
+                await JS.InvokeVoidAsync("renderSensitivity", "Invalid RHS.");
                 return;
             }
 
             var resp = await Http.PostAsJsonAsync("api/solve/change-rhs", new { ConstraintIndex = idx, NewRhs = rhs });
             var text = await resp.Content.ReadAsStringAsync();
-            _sensitivityRaw = string.IsNullOrWhiteSpace(text) ? $"{(int)resp.StatusCode} {resp.ReasonPhrase}" : text;
-            nonbasicResult = null;
-            StateHasChanged();
+
+            // Show plain text (final log + objective) or status line
+            await JS.InvokeVoidAsync("renderSensitivity",
+                string.IsNullOrWhiteSpace(text) ? $"{(int)resp.StatusCode} {resp.ReasonPhrase}" : text);
         }
         catch (Exception ex)
         {
-            _sensitivityRaw = $"Error: {ex.Message}";
-            StateHasChanged();
+            await JS.InvokeVoidAsync("renderSensitivity", $"Error: {ex.Message}");
         }
     }
 
@@ -867,14 +819,13 @@
 
             var resp = await Http.PostAsJsonAsync("api/solve/add-constraint", new { ConstraintText = line });
             var text = await resp.Content.ReadAsStringAsync();
-            _sensitivityRaw = string.IsNullOrWhiteSpace(text) ? $"{(int)resp.StatusCode} {resp.ReasonPhrase}" : text;
-            nonbasicResult = null;
-            StateHasChanged();
+
+            await JS.InvokeVoidAsync("renderSensitivity",
+                string.IsNullOrWhiteSpace(text) ? $"{(int)resp.StatusCode} {resp.ReasonPhrase}" : text);
         }
         catch (Exception ex)
         {
-            _sensitivityRaw = $"Error: {ex.Message}";
-            StateHasChanged();
+            await JS.InvokeVoidAsync("renderSensitivity", $"Error: {ex.Message}");
         }
     }
 
@@ -885,17 +836,88 @@
             var resp = await Http.PostAsync("api/solve/apply-duality", null);
             var raw = await resp.Content.ReadAsStringAsync();
 
-            _sensitivityRaw = (resp.IsSuccessStatusCode && LooksLikeJson(raw))
-                ? PrettyJson(raw)
-                : string.IsNullOrWhiteSpace(raw) ? $"{(int)resp.StatusCode} {resp.ReasonPhrase}" : raw;
+            // Pretty-print JSON if it is JSON, else show raw text
+            string display;
+            if (resp.IsSuccessStatusCode &&
+                !string.IsNullOrWhiteSpace(raw) &&
+                (raw.TrimStart().StartsWith("{") || raw.TrimStart().StartsWith("[")))
+            {
+                using var doc = System.Text.Json.JsonDocument.Parse(raw);
+                display = System.Text.Json.JsonSerializer.Serialize(
+                    doc, new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
+            }
+            else
+            {
+                display = string.IsNullOrWhiteSpace(raw)
+                    ? $"{(int)resp.StatusCode} {resp.ReasonPhrase}"
+                    : raw;
+            }
 
-            nonbasicResult = null;
-            StateHasChanged();
+            await JS.InvokeVoidAsync("renderSensitivity", display);
         }
         catch (Exception ex)
         {
-            _sensitivityRaw = $"Error: {ex.Message}";
-            StateHasChanged();
+            await JS.InvokeVoidAsync("renderSensitivity", $"Error: {ex.Message}");
         }
     }
+
+    private async Task AddActivityViaPrompt()
+    {
+        try
+        {
+            // 1) objective coefficient
+            var objStr = await JS.InvokeAsync<string>("prompt", "Objective coefficient for new variable?", "1");
+            if (string.IsNullOrWhiteSpace(objStr)) return;
+            if (!double.TryParse(objStr, NumberStyles.Any, CultureInfo.InvariantCulture, out var objCoeff))
+            {
+                await JS.InvokeVoidAsync("renderSensitivity", "Invalid objective coefficient.");
+                return;
+            }
+
+            // 2) constraint coefficients, space- or comma-separated, one per constraint (in order)
+            var coeffStr = await JS.InvokeAsync<string>("prompt",
+                "Enter the new variable's coefficients for EACH constraint (space or comma separated, top to bottom):",
+                "0 0 0");
+            if (string.IsNullOrWhiteSpace(coeffStr)) return;
+
+            // split by space or comma
+            var parts = coeffStr.Split(new[] { ' ', ',' }, StringSplitOptions.RemoveEmptyEntries);
+            var coeffs = new List<double>();
+            foreach (var p in parts)
+            {
+                if (!double.TryParse(p, NumberStyles.Any, CultureInfo.InvariantCulture, out var v))
+                {
+                    await JS.InvokeVoidAsync("renderSensitivity", $"Invalid coefficient: {p}");
+                    return;
+                }
+                coeffs.Add(v);
+            }
+
+            // 3) variable tag (defaults to "+")
+            var tag = await JS.InvokeAsync<string>("prompt",
+                "Restriction tag for the new variable? (+, -, int, bin, urs)", "+");
+            if (string.IsNullOrWhiteSpace(tag)) tag = "+";
+
+            // call server to rebuild model and re-solve
+            var resp = await Http.PostAsJsonAsync("api/solve/add-activity", new
+            {
+                ObjCoeff = objCoeff,
+                Coeffs = coeffs.ToArray(),
+                VarTag = tag
+            });
+
+            var text = await resp.Content.ReadAsStringAsync();
+            await JS.InvokeVoidAsync("renderSensitivity",
+                string.IsNullOrWhiteSpace(text) ? $"{(int)resp.StatusCode} {resp.ReasonPhrase}" : text);
+        }
+        catch (Exception ex)
+        {
+            await JS.InvokeVoidAsync("renderSensitivity", $"Error: {ex.Message}");
+        }
+    }
+
+
+
+
+
 }

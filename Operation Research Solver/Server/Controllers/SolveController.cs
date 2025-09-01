@@ -13,7 +13,6 @@ using Solver.Engine.Integer;
 using Solver.Engine.CuttingPlanes;
 using System.Text.RegularExpressions;
 using System.Globalization;
-using Operation_Research_Solver.Server.Services;
 
 namespace Server.Controllers
 {
@@ -618,7 +617,7 @@ namespace Server.Controllers
         }
 
         [HttpPost("add-activity")]
-        public IActionResult AddActivity([FromBody]AddActivityRequest req)
+        public IActionResult AddActivity([FromBody] AddActivityRequest req)
         {
             if (string.IsNullOrWhiteSpace(_lastModelText))
                 return BadRequest("No model text in memory. Solve a model first.");
@@ -703,7 +702,100 @@ namespace Server.Controllers
             return Content(output, "text/plain");
         }
 
+        // ===================== CHANGE NON-BASIC COEFFICIENT (re-solve) =====================
+        public record ChangeNonbasicCoeffRequest(int VarIndex, double NewCoeff); // VarIndex is 1-based
 
+        [HttpPost("change-nonbasic-coeff")]
+        public IActionResult ChangeNonbasicCoeff([FromBody] ChangeNonbasicCoeffRequest req)
+        {
+            if (string.IsNullOrWhiteSpace(_lastModelText))
+                return BadRequest("No model text in memory. Solve a model first.");
+
+            var inv = CultureInfo.InvariantCulture;
+            var lines = _lastModelText.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None).ToList();
+            if (lines.Count < 1) return BadRequest("Model text too short.");
+
+            // objective line is first line: e.g. "max +2 +3 +5 ..."
+            var objLine = lines[0].Trim();
+            var toks = objLine.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries).ToList();
+            if (toks.Count < 2) return BadRequest("Invalid objective line.");
+
+            int n = toks.Count - 1;           // number of variables in objective
+            if (req.VarIndex < 1 || req.VarIndex > n)
+                return BadRequest($"VarIndex out of range. Objective has {n} variables.");
+
+            // helper to format with explicit sign like +3 / -2
+            static string Signed(double v, IFormatProvider invp) =>
+                (v >= 0 ? "+" : "") + v.ToString(invp);
+
+            // replace the coefficient at the requested position (1-based)
+            toks[req.VarIndex] = Signed(req.NewCoeff, inv);
+
+            // rebuild objective line and text
+            lines[0] = string.Join(" ", toks);
+            var newText = string.Join("\n", lines);
+
+            // re-parse & re-solve with Primal Simplex
+            var model = ModelParser.Parse(newText);
+            if (model == null) return BadRequest("Model parse failed after coefficient change.");
+
+            ISolver solver = new PrimalSimplexSolver();
+            var result = solver.Solve(model);
+
+            // update cache
+            _lastModelText = newText;
+            _cache.LastResult = result;
+
+            var output = string.Join("\n", result.Log ?? new List<string>()) +
+                         $"\n\nThe new objective value is: {result.ObjectiveValue:0.####}";
+            return Content(output, "text/plain");
+        }
+
+        // ===================== CHANGE BASIC COEFFICIENT (re-solve) =====================
+        public record ChangeBasicCoeffRequest(int VarIndex, double NewCoeff); // VarIndex is 1-based
+
+        [HttpPost("change-basic-coeff")]
+        public IActionResult ChangeBasicCoeff([FromBody] ChangeBasicCoeffRequest req)
+        {
+            if (string.IsNullOrWhiteSpace(_lastModelText))
+                return BadRequest("No model text in memory. Solve a model first.");
+
+            // In your current model, x3 is the basic variable; enforce it explicitly
+            if (req.VarIndex != 3)
+                return BadRequest("Only x3 can be changed with this tool.");
+
+            var inv = CultureInfo.InvariantCulture;
+            var lines = _lastModelText.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None).ToList();
+            if (lines.Count < 1) return BadRequest("Model text too short.");
+
+            var objLine = lines[0].Trim();
+            var toks = objLine.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries).ToList();
+            if (toks.Count < 2) return BadRequest("Invalid objective line.");
+
+            int n = toks.Count - 1;
+            if (req.VarIndex < 1 || req.VarIndex > n)
+                return BadRequest($"VarIndex out of range. Objective has {n} variables.");
+
+            static string Signed(double v, IFormatProvider invp) =>
+                (v >= 0 ? "+" : "") + v.ToString(invp);
+
+            toks[req.VarIndex] = Signed(req.NewCoeff, inv);
+            lines[0] = string.Join(" ", toks);
+
+            var newText = string.Join("\n", lines);
+            var model = ModelParser.Parse(newText);
+            if (model == null) return BadRequest("Model parse failed after coefficient change.");
+
+            ISolver solver = new PrimalSimplexSolver();
+            var result = solver.Solve(model);
+
+            _lastModelText = newText;
+            _cache.LastResult = result;
+
+            var output = string.Join("\n", result.Log ?? new List<string>()) +
+                         $"\n\nThe new objective value is: {result.ObjectiveValue:0.####}";
+            return Content(output, "text/plain");
+        }
 
 
 
